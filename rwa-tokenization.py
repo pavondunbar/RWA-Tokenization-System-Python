@@ -1,8 +1,10 @@
 import uuid
 import json
-from datetime import datetime
+import logging
+from datetime import datetime, timezone
 from enum import Enum
 from decimal import Decimal
+from types import SimpleNamespace
 
 # -----------------------------------------------
 # Enums — State Machines
@@ -84,6 +86,109 @@ class InsufficientTokenBalanceError(Exception):
 
 
 # -----------------------------------------------
+# PostgresDB — Real Postgres Connection
+# -----------------------------------------------
+
+class PostgresDB:
+    """Thin wrapper around psycopg2 providing the .query()
+    and .transaction() interface all service classes expect."""
+
+    def __init__(self, dsn):
+        self.dsn = dsn
+
+    def _connect(self):
+        import psycopg2
+        import psycopg2.extras
+        psycopg2.extras.register_uuid()
+        return psycopg2.connect(self.dsn)
+
+    def query(self, sql, params=None):
+        conn = self._connect()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql, params)
+                if cur.description is None:
+                    return None
+                cols = [d[0] for d in cur.description]
+                row = cur.fetchone()
+                if row is None:
+                    return None
+                return SimpleNamespace(**dict(zip(cols, row)))
+        finally:
+            conn.close()
+
+    def transaction(self):
+        return PostgresTransaction(self._connect())
+
+
+class PostgresTransaction:
+    """Context manager wrapping a psycopg2 connection
+    with commit/rollback semantics."""
+
+    def __init__(self, conn):
+        self.conn = conn
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        if exc_type is None:
+            self.conn.commit()
+        else:
+            self.conn.rollback()
+        self.conn.close()
+
+    def query(self, sql, params=None):
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            if cur.description is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return SimpleNamespace(**dict(zip(cols, row)))
+
+    def execute(self, sql, params=None):
+        with self.conn.cursor() as cur:
+            cur.execute(sql, params)
+            if cur.description is None:
+                return None
+            cols = [d[0] for d in cur.description]
+            row = cur.fetchone()
+            if row is None:
+                return None
+            return SimpleNamespace(**dict(zip(cols, row)))
+
+
+# -----------------------------------------------
+# KafkaSigningQueue — Real Kafka Producer
+# -----------------------------------------------
+
+class KafkaSigningQueue:
+    """Wraps KafkaProducer with the same send() signature
+    that TokenMintingService and TokenRedemptionService expect."""
+
+    def __init__(self, producer):
+        self.producer = producer
+
+    def send(self, message_body, message_group_id,
+             message_deduplication_id):
+        self.producer.send(
+            topic="rwa.signing_requests",
+            key=message_group_id.encode(),
+            value=json.dumps(message_body).encode(),
+            headers=[
+                (
+                    "deduplication_id",
+                    message_deduplication_id.encode()
+                ),
+            ],
+        )
+        self.producer.flush()
+
+
+# -----------------------------------------------
 # RWA Registry — Register Real World Assets
 # -----------------------------------------------
 
@@ -143,8 +248,8 @@ class RWARegistry:
                     custodian,
                     AssetStatus.PENDING_LEGAL.value,
                     idempotency_key,
-                    datetime.utcnow(),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -166,7 +271,7 @@ class RWARegistry:
                         "jurisdiction": jurisdiction,
                         "custodian":    custodian
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -246,7 +351,7 @@ class LegalWrapperService:
                     str(token_supply),
                     str(price_per_token),
                     "active",
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -261,8 +366,8 @@ class LegalWrapperService:
                     asset_id,
                     str(token_supply),
                     "0",                        # nothing minted yet
-                    datetime.utcnow(),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc),
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -290,7 +395,7 @@ class LegalWrapperService:
                         "token_supply":    str(token_supply),
                         "price_per_token": str(price_per_token)
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -377,7 +482,7 @@ class KYCComplianceService:
                     ComplianceStatus.APPROVED.value,
                     kyc_result.reference_id,
                     idempotency_key,
-                    datetime.utcnow(),
+                    datetime.now(timezone.utc),
                     kyc_result.expiry_date     # KYC expires — must re-verify
                 )
             )
@@ -394,7 +499,7 @@ class KYCComplianceService:
                     investor_id,
                     wallet_address,
                     investor_tier.value,
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -413,7 +518,7 @@ class KYCComplianceService:
                         "tier":           investor_tier.value,
                         "jurisdiction":   jurisdiction
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -473,7 +578,7 @@ class KYCComplianceService:
                         "investor_id": str(investor_id),
                         "reason":      reason
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -577,7 +682,7 @@ class TokenMintingService:
                     str(fiat_received),
                     MintStatus.PENDING.value,
                     idempotency_key,
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -599,7 +704,7 @@ class TokenMintingService:
                         "token_amount":  str(token_amount),
                         "fiat_received": str(fiat_received)
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -655,7 +760,7 @@ class TokenMintingService:
                         "tx_hash":     tx_hash,
                         "block_number": str(block_number)
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -740,7 +845,7 @@ class TokenRedemptionService:
                     bank_account,
                     RedemptionStatus.PENDING.value,
                     idempotency_key,
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -759,7 +864,7 @@ class TokenRedemptionService:
                         "wallet":        wallet_address,
                         "token_amount":  str(token_amount)
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -830,7 +935,7 @@ class TokenRedemptionService:
                         "bank_account":  redemption.bank_account,
                         "token_amount":  str(redemption.token_amount)
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -905,7 +1010,7 @@ class NAVCalculationEngine:
                     str(asset.total_value),
                     str(daily_yield),
                     str(annual_yield_rate),
-                    datetime.utcnow(),
+                    datetime.now(timezone.utc),
                     idempotency_key
                 )
             )
@@ -934,7 +1039,7 @@ class NAVCalculationEngine:
                         "daily_yield": str(daily_yield),
                         "yield_rate":  str(annual_yield_rate)
                     }),
-                    datetime.utcnow()
+                    datetime.now(timezone.utc)
                 )
             )
 
@@ -1020,9 +1125,6 @@ class RWAReconciliationEngine:
 # Outbox Publisher — Deliver Events to Kafka
 # -----------------------------------------------
 
-import asyncio
-import logging
-
 logger = logging.getLogger(__name__)
 
 class RWAOutboxPublisher:
@@ -1038,254 +1140,124 @@ class RWAOutboxPublisher:
         self.kafka = kafka_producer
         self.batch_size = batch_size
 
-    async def poll_and_publish(self):
-        async with self.db.acquire() as conn:
-            events = await conn.fetch(
-                "SELECT id, aggregate_id, event_type, payload "
-                "FROM outbox_events "
-                "WHERE published_at IS NULL "
-                "ORDER BY created_at "
-                "LIMIT $1 "
-                "FOR UPDATE SKIP LOCKED",
-                self.batch_size
-            )
-
-            if not events:
-                return
-
-            for event in events:
-                await self.kafka.send(
-                    topic=f"rwa.{event['event_type']}",
-                    key=event["aggregate_id"].encode(),
-                    value=event["payload"].encode()
+    def poll_and_publish(self):
+        """Poll unpublished outbox events and send to Kafka.
+        Returns the number of events published."""
+        conn = self.db._connect()
+        published = 0
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT id, aggregate_id, event_type, "
+                    "payload "
+                    "FROM outbox_events "
+                    "WHERE published_at IS NULL "
+                    "ORDER BY created_at "
+                    "LIMIT %s "
+                    "FOR UPDATE SKIP LOCKED",
+                    (self.batch_size,)
                 )
+                cols = [d[0] for d in cur.description]
+                rows = cur.fetchall()
 
-                # Mark published INSIDE loop — per event
-                # If Kafka fails mid-batch only published
-                # events get marked — rest retry next poll
-                await conn.execute(
-                    "UPDATE outbox_events "
-                    "SET published_at = NOW() "
-                    "WHERE id = $1",
-                    event["id"]
-                )
+                for row in rows:
+                    event = dict(zip(cols, row))
+                    payload = event["payload"]
+                    if isinstance(payload, dict):
+                        payload = json.dumps(payload)
 
-    async def run_forever(self, poll_interval=1):
-        while True:
-            try:
-                await self.poll_and_publish()
-            except Exception as e:
-                logger.error(f"RWA outbox poll failed: {e}")
-            await asyncio.sleep(poll_interval)
+                    self.kafka.send(
+                        topic=f"rwa.{event['event_type']}",
+                        key=event["aggregate_id"].encode(),
+                        value=payload.encode(),
+                    )
+
+                    cur.execute(
+                        "UPDATE outbox_events "
+                        "SET published_at = NOW() "
+                        "WHERE id = %s",
+                        (event["id"],)
+                    )
+                    published += 1
+
+            self.kafka.flush()
+            conn.commit()
+        except Exception:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+        return published
 
 
 # -----------------------------------------------
-# In-Memory Demo Simulation
+# Demo — Real Postgres + Kafka
 # -----------------------------------------------
 
 if __name__ == "__main__":
-    from types import SimpleNamespace
     from datetime import timedelta
 
-    # -- Mock objects for all external dependencies --
+    DSN = "dbname=rwa user=postgres"
 
-    class MockDB:
-        """In-memory dict store mimicking Postgres."""
+    # -- External service stubs --
+    # These represent third-party APIs that cannot be replaced
+    # with local infrastructure.
 
-        def __init__(self):
-            self.tables = {}
-            self.events = []
-            self.whitelisted_wallets = {"ISSUER_WALLET"}
-
-        def query(self, sql, params=None):
-            if "whitelisted_wallets" in sql and params:
-                wallet = params[0]
-                if wallet in self.whitelisted_wallets:
-                    return SimpleNamespace(id="whitelisted")
-            if "rwa_token_supply" in sql and "rwa_assets" in sql:
-                asset_id = params[0] if params else None
-                supply = self.tables.get(f"supply:{asset_id}")
-                asset = self.tables.get(f"asset:{asset_id}")
-                if supply and asset:
-                    return SimpleNamespace(
-                        minted_supply=supply.minted_supply,
-                        total_value=asset.total_value,
-                    )
-            return None
-
-        def transaction(self):
-            return MockTransaction(self)
-
-    class MockTransaction:
-        def __init__(self, db):
-            self.db = db
-            self._result = None
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *args):
-            pass
-
-        def query(self, sql, params=None):
-            asset_id = params[0] if params else None
-            key = str(asset_id)
-
-            if "rwa_assets" in sql:
-                return self.db.tables.get(f"asset:{key}")
-            if "rwa_token_supply" in sql:
-                return self.db.tables.get(f"supply:{key}")
-            if "token_mints" in sql and "investor_id" in sql:
-                investor_id = params[0]
-                return self.db.tables.get(
-                    f"investor_mint:{investor_id}:{params[1]}"
-                )
-            if "token_mints" in sql:
-                return self.db.tables.get(f"mint:{key}")
-            if "token_redemptions" in sql:
-                return self.db.tables.get(f"redemption:{key}")
-            return None
-
-        def execute(self, sql, params=None):
-            if "rwa_assets" in sql and "INSERT" in sql:
-                asset = SimpleNamespace(
-                    id=params[0],
-                    type=params[1],
-                    name=params[2],
-                    total_value=params[3],
-                    jurisdiction=params[4],
-                    custodian=params[5],
-                    status=params[6],
-                )
-                self.db.tables[f"asset:{params[0]}"] = asset
-                self._result = asset
-                return asset
-
-            if "rwa_token_supply" in sql and "INSERT" in sql:
-                supply = SimpleNamespace(
-                    id=params[0],
-                    asset_id=params[1],
-                    total_supply=params[2],
-                    minted_supply=params[3],
-                )
-                self.db.tables[f"supply:{params[1]}"] = supply
-                return supply
-
-            if "rwa_token_supply" in sql and "UPDATE" in sql:
-                key = f"supply:{params[1]}"
-                supply = self.db.tables.get(key)
-                if supply:
-                    new_minted = (
-                        Decimal(supply.minted_supply)
-                        + Decimal(params[0])
-                    )
-                    supply.minted_supply = str(new_minted)
-
-            if "rwa_assets" in sql and "UPDATE" in sql:
-                if "status" in sql:
-                    key = f"asset:{params[1]}"
-                    asset = self.db.tables.get(key)
-                    if asset:
-                        asset.status = params[0]
-                elif "total_value" in sql:
-                    key = f"asset:{params[1]}"
-                    asset = self.db.tables.get(key)
-                    if asset:
-                        new_val = (
-                            Decimal(asset.total_value)
-                            + Decimal(params[0])
-                        )
-                        asset.total_value = str(new_val)
-
-            if "token_mints" in sql and "INSERT" in sql:
-                mint = SimpleNamespace(
-                    id=params[0],
-                    asset_id=params[1],
-                    investor_id=params[2],
-                    wallet_address=params[3],
-                    token_amount=params[4],
-                    fiat_received=params[5],
-                    status=params[6],
-                )
-                self.db.tables[f"mint:{params[0]}"] = mint
-                inv_key = f"investor_mint:{params[2]}:{params[1]}"
-                self.db.tables[inv_key] = mint
-                self._result = mint
-                return mint
-
-            if "token_redemptions" in sql and "INSERT" in sql:
-                redemption = SimpleNamespace(
-                    id=params[0],
-                    asset_id=params[1],
-                    investor_id=params[2],
-                    wallet_address=params[3],
-                    token_amount=params[4],
-                    bank_account=params[5],
-                    status=params[6],
-                )
-                key = f"redemption:{params[0]}"
-                self.db.tables[key] = redemption
-                self._result = redemption
-                return redemption
-
-            if "token_redemptions" in sql and "UPDATE" in sql:
-                key = f"redemption:{params[1]}"
-                r = self.db.tables.get(key)
-                if r:
-                    r.status = params[0]
-
-            if "whitelisted_wallets" in sql and "INSERT" in sql:
-                wallet_address = params[2]
-                self.db.whitelisted_wallets.add(wallet_address)
-
-            if "outbox_events" in sql:
-                self.db.events.append(params)
-
-            return self._result
-
-    class MockCustodianRegistry:
-        def validate(self, custodian):
-            return True
-
-    class MockKYCProvider:
+    class StubKYCProvider:
         def verify(self, investor_id, tier):
             return SimpleNamespace(
                 passed=True,
-                reference_id=f"KYC-{uuid.uuid4().hex[:8].upper()}",
-                expiry_date=datetime.utcnow() + timedelta(days=365),
+                reference_id=(
+                    f"KYC-{uuid.uuid4().hex[:8].upper()}"
+                ),
+                expiry_date=(
+                    datetime.now(timezone.utc)
+                    + timedelta(days=365)
+                ),
                 reason=None,
             )
 
-    class MockSanctionsChecker:
+    class StubSanctionsChecker:
         def screen(self, investor_id, jurisdiction):
             return SimpleNamespace(is_sanctioned=False)
 
-    class MockSigningQueue:
-        def send(self, message_body, message_group_id,
-                 message_deduplication_id):
-            pass
+    class StubBlockchainService:
+        """Returns on-chain supply from our own DB
+        (in production this reads from an Ethereum node)."""
 
-    class MockBlockchainService:
         def __init__(self, db):
             self.db = db
 
         def get_total_supply(self, asset_id):
-            supply = self.db.tables.get(f"supply:{asset_id}")
-            if supply:
-                return Decimal(supply.minted_supply)
+            row = self.db.query(
+                "SELECT minted_supply "
+                "FROM rwa_token_supply "
+                "WHERE asset_id = %s",
+                (asset_id,)
+            )
+            if row:
+                return Decimal(row.minted_supply)
             return Decimal("0")
 
-    class MockCustodianAPI:
+    class StubCustodianAPI:
+        """Returns custodian NAV from our own DB
+        (in production this calls custodian's API)."""
+
         def __init__(self, db):
             self.db = db
 
         def get_nav(self, asset_id):
-            asset = self.db.tables.get(f"asset:{asset_id}")
-            if asset:
-                return Decimal(asset.total_value)
+            row = self.db.query(
+                "SELECT total_value FROM rwa_assets "
+                "WHERE id = %s",
+                (asset_id,)
+            )
+            if row:
+                return Decimal(row.total_value)
             return Decimal("0")
 
-    class MockAlertService:
+    class StubAlertService:
         def critical(self, message, details):
             print(f"  ALERT: {message}")
             for d in details:
@@ -1301,20 +1273,40 @@ if __name__ == "__main__":
     def kv(label, value):
         print(f"  {label:<22} {value}")
 
-    # -- Wire up services --
+    # -- Wire up real services --
 
-    db = MockDB()
-    custodian_registry = MockCustodianRegistry()
-    kyc_provider = MockKYCProvider()
-    sanctions_checker = MockSanctionsChecker()
-    signing_queue = MockSigningQueue()
-    blockchain_svc = MockBlockchainService(db)
-    custodian_api = MockCustodianAPI(db)
-    alert_service = MockAlertService()
+    db = PostgresDB(DSN)
 
-    registry = RWARegistry(db, custodian_registry)
+    try:
+        from kafka import KafkaProducer
+        kafka_producer = KafkaProducer(
+            bootstrap_servers="localhost:9092",
+        )
+        signing_queue = KafkaSigningQueue(kafka_producer)
+    except Exception as exc:
+        print(f"  Kafka unavailable ({exc}), using no-op queue")
+
+        class _NoOpQueue:
+            def send(self, **_kw):
+                pass
+
+            def flush(self):
+                pass
+
+        kafka_producer = _NoOpQueue()
+        signing_queue = KafkaSigningQueue(kafka_producer)
+
+    kyc_provider = StubKYCProvider()
+    sanctions_checker = StubSanctionsChecker()
+    blockchain_svc = StubBlockchainService(db)
+    custodian_api = StubCustodianAPI(db)
+    alert_service = StubAlertService()
+
+    registry = RWARegistry(db, None)
     legal_svc = LegalWrapperService(db)
-    kyc_svc = KYCComplianceService(db, kyc_provider, sanctions_checker)
+    kyc_svc = KYCComplianceService(
+        db, kyc_provider, sanctions_checker
+    )
     mint_svc = TokenMintingService(db, kyc_svc, signing_queue)
     nav_engine = NAVCalculationEngine(db, None, signing_queue)
     recon_engine = RWAReconciliationEngine(
@@ -1323,9 +1315,10 @@ if __name__ == "__main__":
     redemption_svc = TokenRedemptionService(
         db, kyc_svc, signing_queue, None
     )
+    outbox_publisher = RWAOutboxPublisher(db, kafka_producer)
 
     print("\n" + "#" * 60)
-    print("#  RWA Tokenization Demo — In-Memory Simulation")
+    print("#  RWA Tokenization — Postgres + Kafka")
     print("#  Modeled after BlackRock BUIDL ($2.9B T-Bill Fund)")
     print("#" * 60)
 
@@ -1335,14 +1328,14 @@ if __name__ == "__main__":
     asset_id = uuid.uuid4()
     asset_name = "Blackstone Treasury Token Fund"
     total_value = Decimal("500000000")
-    custodian = "BNY Mellon"
+    custodian_name = "BNY Mellon"
 
     asset = registry.register_asset(
         asset_type=AssetType.FUND,
         name=asset_name,
         total_value=total_value,
         jurisdiction="Delaware, United States",
-        custodian=custodian,
+        custodian=custodian_name,
         idempotency_key=f"register-{asset_id}",
     )
 
@@ -1351,7 +1344,7 @@ if __name__ == "__main__":
     kv("Name:", asset_name)
     kv("Type:", AssetType.FUND.value)
     kv("Total Value:", f"${total_value:,.2f}")
-    kv("Custodian:", custodian)
+    kv("Custodian:", custodian_name)
     kv("Status:", AssetStatus.PENDING_LEGAL.value)
 
     # ---- Step 2: Create Legal Wrapper ----
@@ -1375,10 +1368,14 @@ if __name__ == "__main__":
     # ---- Step 3: Onboard Investors ----
     header(3, "Onboard Investors (KYC/AML)")
 
-    # Manually advance asset to tokenized so minting works
-    db.tables[f"asset:{asset_id}"].status = (
-        AssetStatus.TOKENIZED.value
-    )
+    # Advance asset to tokenized so minting works
+    with db.transaction() as tx:
+        tx.execute(
+            "UPDATE rwa_assets "
+            "SET status = %s, updated_at = NOW() "
+            "WHERE id = %s",
+            (AssetStatus.TOKENIZED.value, asset_id)
+        )
 
     investors = [
         ("Citadel Securities", Decimal("50000000"),
@@ -1424,14 +1421,20 @@ if __name__ == "__main__":
             fiat_received=amount,
             idempotency_key=f"mint-{inv_id}",
         )
-        mint_records.append((name, inv_id, wallet, token_amount, mint))
+        mint_records.append(
+            (name, inv_id, wallet, token_amount, mint)
+        )
         kv(f"{name}:", "")
         kv("  Tokens Minted:", f"{token_amount:,}")
         kv("  Fiat Received:", f"${amount:,.2f}")
         kv("  Mint Status:", MintStatus.PENDING.value)
         print()
 
-    supply = db.tables.get(f"supply:{asset_id}")
+    supply = db.query(
+        "SELECT total_supply, minted_supply "
+        "FROM rwa_token_supply WHERE asset_id = %s",
+        (asset_id,)
+    )
     kv("Total Minted Supply:",
        f"{Decimal(supply.minted_supply):,.0f} / "
        f"{Decimal(supply.total_supply):,.0f}")
@@ -1465,15 +1468,24 @@ if __name__ == "__main__":
     header(6, "Reconciliation (On-Chain vs Ledger)")
 
     result = recon_engine.reconcile_asset(asset_id)
-    internal_supply = supply.minted_supply
+    supply = db.query(
+        "SELECT minted_supply FROM rwa_token_supply "
+        "WHERE asset_id = %s",
+        (asset_id,)
+    )
     onchain_supply = blockchain_svc.get_total_supply(asset_id)
     custodian_nav = custodian_api.get_nav(asset_id)
-    asset_obj = db.tables.get(f"asset:{asset_id}")
+    asset_row = db.query(
+        "SELECT total_value FROM rwa_assets WHERE id = %s",
+        (asset_id,)
+    )
 
-    kv("Internal Supply:", f"{Decimal(internal_supply):,.0f}")
+    kv("Internal Supply:",
+       f"{Decimal(supply.minted_supply):,.0f}")
     kv("On-Chain Supply:", f"{onchain_supply:,.0f}")
     kv("Supply Match:", "YES" if result else "NO")
-    kv("Internal NAV:", f"${Decimal(asset_obj.total_value):,.2f}")
+    kv("Internal NAV:",
+       f"${Decimal(asset_row.total_value):,.2f}")
     kv("Custodian NAV:", f"${custodian_nav:,.2f}")
     kv("NAV Match:", "YES" if result else "NO")
     kv("Reconciliation:", "PASSED" if result else "FAILED")
@@ -1481,8 +1493,19 @@ if __name__ == "__main__":
     # ---- Step 7: Redemption ----
     header(7, "Redemption (Goldman Redeems 5M Tokens)")
 
-    gs_name, gs_id, gs_wallet, gs_amount, _ = investor_records[2]
+    gs_name, gs_id, gs_wallet, gs_amount, _ = (
+        investor_records[2]
+    )
     redeem_amount = 5_000_000
+
+    # Confirm the mint first so the redemption balance check
+    # finds a confirmed row.
+    gs_mint = mint_records[2][4]
+    mint_svc.confirm_mint(
+        gs_mint.id,
+        tx_hash="0x" + uuid.uuid4().hex,
+        block_number=19_000_000,
+    )
 
     redemption_id = redemption_svc.request_redemption(
         asset_id=asset_id,
@@ -1501,13 +1524,50 @@ if __name__ == "__main__":
     kv("Redemption Status:", RedemptionStatus.PENDING.value)
     kv("Redemption ID:", str(redemption_id)[:12] + "...")
 
+    # ---- Step 8: Publish Outbox Events to Kafka ----
+    header(8, "Publish Outbox Events to Kafka")
+
+    published = outbox_publisher.poll_and_publish()
+    kv("Events Published:", str(published))
+
+    total_events = db.query(
+        "SELECT COUNT(*) AS cnt FROM outbox_events", ()
+    )
+    unpublished = db.query(
+        "SELECT COUNT(*) AS cnt FROM outbox_events "
+        "WHERE published_at IS NULL", ()
+    )
+    kv("Total Outbox Events:", str(total_events.cnt))
+    kv("Remaining:", str(unpublished.cnt))
+
     # -- Summary --
     print(f"\n{'=' * 60}")
-    print("  Simulation Complete")
+    print("  Demo Complete")
     print(f"{'=' * 60}")
+
+    asset_row = db.query(
+        "SELECT total_value FROM rwa_assets WHERE id = %s",
+        (asset_id,)
+    )
+    supply = db.query(
+        "SELECT minted_supply FROM rwa_token_supply "
+        "WHERE asset_id = %s",
+        (asset_id,)
+    )
+    total_events = db.query(
+        "SELECT COUNT(*) AS cnt FROM outbox_events", ()
+    )
+
     print(f"  Asset:           {asset_name}")
     print(f"  Investors:       {len(investor_records)}")
-    print(f"  Tokens Minted:   {Decimal(supply.minted_supply):,.0f}")
-    print(f"  Fund NAV:        ${Decimal(asset_obj.total_value):,.2f}")
-    print(f"  Outbox Events:   {len(db.events)}")
+    print(
+        f"  Tokens Minted:   "
+        f"{Decimal(supply.minted_supply):,.0f}"
+    )
+    print(
+        f"  Fund NAV:        "
+        f"${Decimal(asset_row.total_value):,.2f}"
+    )
+    print(f"  Outbox Events:   {total_events.cnt}")
+    print(f"  Kafka Published: {published}")
     print(f"{'=' * 60}\n")

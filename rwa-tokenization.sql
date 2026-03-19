@@ -32,6 +32,7 @@ CREATE TABLE investor_compliance (
   kyc_reference VARCHAR(256),
   idempotency_key VARCHAR(256) UNIQUE,
   created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP,
   expires_at TIMESTAMP NOT NULL         -- KYC expires, must re-verify
 );
 
@@ -51,9 +52,52 @@ CREATE TABLE token_mints (
   token_amount DECIMAL(38,18) NOT NULL,
   fiat_received DECIMAL(38,18) NOT NULL,
   status VARCHAR(20) NOT NULL,
+  tx_hash VARCHAR(256),
+  block_number BIGINT,
   idempotency_key VARCHAR(256) UNIQUE,
   created_at TIMESTAMP NOT NULL,
   confirmed_at TIMESTAMP               -- NULL until on-chain confirmation
+);
+
+CREATE TABLE rwa_token_supply (
+  id UUID PRIMARY KEY,
+  asset_id UUID REFERENCES rwa_assets(id) UNIQUE,
+  total_supply DECIMAL(38,18) NOT NULL,
+  minted_supply DECIMAL(38,18) NOT NULL DEFAULT 0,
+  created_at TIMESTAMP NOT NULL,
+  updated_at TIMESTAMP NOT NULL
+);
+
+CREATE TABLE nav_calculations (
+  id UUID PRIMARY KEY,
+  asset_id UUID REFERENCES rwa_assets(id),
+  total_value DECIMAL(38,18) NOT NULL,
+  daily_yield DECIMAL(38,18) NOT NULL,
+  yield_rate DECIMAL(38,18) NOT NULL,
+  calculated_at TIMESTAMP NOT NULL,
+  idempotency_key VARCHAR(256) UNIQUE
+);
+
+CREATE TABLE token_redemptions (
+  id UUID PRIMARY KEY,
+  asset_id UUID REFERENCES rwa_assets(id),
+  investor_id UUID NOT NULL,
+  wallet_address VARCHAR(256) NOT NULL,
+  token_amount DECIMAL(38,18) NOT NULL,
+  bank_account VARCHAR(256) NOT NULL,
+  status VARCHAR(20) NOT NULL,
+  idempotency_key VARCHAR(256) UNIQUE,
+  created_at TIMESTAMP NOT NULL,
+  settled_at TIMESTAMP
+);
+
+CREATE TABLE outbox_events (
+  id UUID PRIMARY KEY,
+  aggregate_id VARCHAR(256) NOT NULL,
+  event_type VARCHAR(256) NOT NULL,
+  payload JSONB NOT NULL,
+  created_at TIMESTAMP NOT NULL,
+  published_at TIMESTAMP
 );
 
 --- SAMPLE DATA: BLACKROCK'S BUIDL TOKEN --
@@ -183,6 +227,18 @@ SELECT
     NOW()
 FROM investor_compliance
 WHERE status = 'approved';
+
+-- Issuer wallet — required by can_transfer() for minting
+INSERT INTO whitelisted_wallets (
+    id, investor_id, wallet_address, tier, created_at
+)
+VALUES (
+    gen_random_uuid(),
+    gen_random_uuid(),
+    'ISSUER_WALLET',
+    'institutional',
+    NOW()
+);
 
 SELECT * FROM whitelisted_wallets;
 
