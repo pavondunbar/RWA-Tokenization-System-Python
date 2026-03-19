@@ -1077,3 +1077,437 @@ class RWAOutboxPublisher:
             except Exception as e:
                 logger.error(f"RWA outbox poll failed: {e}")
             await asyncio.sleep(poll_interval)
+
+
+# -----------------------------------------------
+# In-Memory Demo Simulation
+# -----------------------------------------------
+
+if __name__ == "__main__":
+    from types import SimpleNamespace
+    from datetime import timedelta
+
+    # -- Mock objects for all external dependencies --
+
+    class MockDB:
+        """In-memory dict store mimicking Postgres."""
+
+        def __init__(self):
+            self.tables = {}
+            self.events = []
+            self.whitelisted_wallets = {"ISSUER_WALLET"}
+
+        def query(self, sql, params=None):
+            if "whitelisted_wallets" in sql and params:
+                wallet = params[0]
+                if wallet in self.whitelisted_wallets:
+                    return SimpleNamespace(id="whitelisted")
+            if "rwa_token_supply" in sql and "rwa_assets" in sql:
+                asset_id = params[0] if params else None
+                supply = self.tables.get(f"supply:{asset_id}")
+                asset = self.tables.get(f"asset:{asset_id}")
+                if supply and asset:
+                    return SimpleNamespace(
+                        minted_supply=supply.minted_supply,
+                        total_value=asset.total_value,
+                    )
+            return None
+
+        def transaction(self):
+            return MockTransaction(self)
+
+    class MockTransaction:
+        def __init__(self, db):
+            self.db = db
+            self._result = None
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def query(self, sql, params=None):
+            asset_id = params[0] if params else None
+            key = str(asset_id)
+
+            if "rwa_assets" in sql:
+                return self.db.tables.get(f"asset:{key}")
+            if "rwa_token_supply" in sql:
+                return self.db.tables.get(f"supply:{key}")
+            if "token_mints" in sql and "investor_id" in sql:
+                investor_id = params[0]
+                return self.db.tables.get(
+                    f"investor_mint:{investor_id}:{params[1]}"
+                )
+            if "token_mints" in sql:
+                return self.db.tables.get(f"mint:{key}")
+            if "token_redemptions" in sql:
+                return self.db.tables.get(f"redemption:{key}")
+            return None
+
+        def execute(self, sql, params=None):
+            if "rwa_assets" in sql and "INSERT" in sql:
+                asset = SimpleNamespace(
+                    id=params[0],
+                    type=params[1],
+                    name=params[2],
+                    total_value=params[3],
+                    jurisdiction=params[4],
+                    custodian=params[5],
+                    status=params[6],
+                )
+                self.db.tables[f"asset:{params[0]}"] = asset
+                self._result = asset
+                return asset
+
+            if "rwa_token_supply" in sql and "INSERT" in sql:
+                supply = SimpleNamespace(
+                    id=params[0],
+                    asset_id=params[1],
+                    total_supply=params[2],
+                    minted_supply=params[3],
+                )
+                self.db.tables[f"supply:{params[1]}"] = supply
+                return supply
+
+            if "rwa_token_supply" in sql and "UPDATE" in sql:
+                key = f"supply:{params[1]}"
+                supply = self.db.tables.get(key)
+                if supply:
+                    new_minted = (
+                        Decimal(supply.minted_supply)
+                        + Decimal(params[0])
+                    )
+                    supply.minted_supply = str(new_minted)
+
+            if "rwa_assets" in sql and "UPDATE" in sql:
+                if "status" in sql:
+                    key = f"asset:{params[1]}"
+                    asset = self.db.tables.get(key)
+                    if asset:
+                        asset.status = params[0]
+                elif "total_value" in sql:
+                    key = f"asset:{params[1]}"
+                    asset = self.db.tables.get(key)
+                    if asset:
+                        new_val = (
+                            Decimal(asset.total_value)
+                            + Decimal(params[0])
+                        )
+                        asset.total_value = str(new_val)
+
+            if "token_mints" in sql and "INSERT" in sql:
+                mint = SimpleNamespace(
+                    id=params[0],
+                    asset_id=params[1],
+                    investor_id=params[2],
+                    wallet_address=params[3],
+                    token_amount=params[4],
+                    fiat_received=params[5],
+                    status=params[6],
+                )
+                self.db.tables[f"mint:{params[0]}"] = mint
+                inv_key = f"investor_mint:{params[2]}:{params[1]}"
+                self.db.tables[inv_key] = mint
+                self._result = mint
+                return mint
+
+            if "token_redemptions" in sql and "INSERT" in sql:
+                redemption = SimpleNamespace(
+                    id=params[0],
+                    asset_id=params[1],
+                    investor_id=params[2],
+                    wallet_address=params[3],
+                    token_amount=params[4],
+                    bank_account=params[5],
+                    status=params[6],
+                )
+                key = f"redemption:{params[0]}"
+                self.db.tables[key] = redemption
+                self._result = redemption
+                return redemption
+
+            if "token_redemptions" in sql and "UPDATE" in sql:
+                key = f"redemption:{params[1]}"
+                r = self.db.tables.get(key)
+                if r:
+                    r.status = params[0]
+
+            if "whitelisted_wallets" in sql and "INSERT" in sql:
+                wallet_address = params[2]
+                self.db.whitelisted_wallets.add(wallet_address)
+
+            if "outbox_events" in sql:
+                self.db.events.append(params)
+
+            return self._result
+
+    class MockCustodianRegistry:
+        def validate(self, custodian):
+            return True
+
+    class MockKYCProvider:
+        def verify(self, investor_id, tier):
+            return SimpleNamespace(
+                passed=True,
+                reference_id=f"KYC-{uuid.uuid4().hex[:8].upper()}",
+                expiry_date=datetime.utcnow() + timedelta(days=365),
+                reason=None,
+            )
+
+    class MockSanctionsChecker:
+        def screen(self, investor_id, jurisdiction):
+            return SimpleNamespace(is_sanctioned=False)
+
+    class MockSigningQueue:
+        def send(self, message_body, message_group_id,
+                 message_deduplication_id):
+            pass
+
+    class MockBlockchainService:
+        def __init__(self, db):
+            self.db = db
+
+        def get_total_supply(self, asset_id):
+            supply = self.db.tables.get(f"supply:{asset_id}")
+            if supply:
+                return Decimal(supply.minted_supply)
+            return Decimal("0")
+
+    class MockCustodianAPI:
+        def __init__(self, db):
+            self.db = db
+
+        def get_nav(self, asset_id):
+            asset = self.db.tables.get(f"asset:{asset_id}")
+            if asset:
+                return Decimal(asset.total_value)
+            return Decimal("0")
+
+    class MockAlertService:
+        def critical(self, message, details):
+            print(f"  ALERT: {message}")
+            for d in details:
+                print(f"    {d}")
+
+    # -- Helpers --
+
+    def header(step, title):
+        print(f"\n{'=' * 60}")
+        print(f"  Step {step}: {title}")
+        print(f"{'=' * 60}")
+
+    def kv(label, value):
+        print(f"  {label:<22} {value}")
+
+    # -- Wire up services --
+
+    db = MockDB()
+    custodian_registry = MockCustodianRegistry()
+    kyc_provider = MockKYCProvider()
+    sanctions_checker = MockSanctionsChecker()
+    signing_queue = MockSigningQueue()
+    blockchain_svc = MockBlockchainService(db)
+    custodian_api = MockCustodianAPI(db)
+    alert_service = MockAlertService()
+
+    registry = RWARegistry(db, custodian_registry)
+    legal_svc = LegalWrapperService(db)
+    kyc_svc = KYCComplianceService(db, kyc_provider, sanctions_checker)
+    mint_svc = TokenMintingService(db, kyc_svc, signing_queue)
+    nav_engine = NAVCalculationEngine(db, None, signing_queue)
+    recon_engine = RWAReconciliationEngine(
+        db, blockchain_svc, custodian_api, alert_service
+    )
+    redemption_svc = TokenRedemptionService(
+        db, kyc_svc, signing_queue, None
+    )
+
+    print("\n" + "#" * 60)
+    print("#  RWA Tokenization Demo — In-Memory Simulation")
+    print("#  Modeled after BlackRock BUIDL ($2.9B T-Bill Fund)")
+    print("#" * 60)
+
+    # ---- Step 1: Register Asset ----
+    header(1, "Register Real-World Asset")
+
+    asset_id = uuid.uuid4()
+    asset_name = "Blackstone Treasury Token Fund"
+    total_value = Decimal("500000000")
+    custodian = "BNY Mellon"
+
+    asset = registry.register_asset(
+        asset_type=AssetType.FUND,
+        name=asset_name,
+        total_value=total_value,
+        jurisdiction="Delaware, United States",
+        custodian=custodian,
+        idempotency_key=f"register-{asset_id}",
+    )
+
+    asset_id = asset.id
+    kv("Asset ID:", str(asset_id)[:12] + "...")
+    kv("Name:", asset_name)
+    kv("Type:", AssetType.FUND.value)
+    kv("Total Value:", f"${total_value:,.2f}")
+    kv("Custodian:", custodian)
+    kv("Status:", AssetStatus.PENDING_LEGAL.value)
+
+    # ---- Step 2: Create Legal Wrapper ----
+    header(2, "Create Legal Wrapper (Delaware Trust)")
+
+    token_supply = 500_000_000
+    wrapper_id = legal_svc.create_legal_wrapper(
+        asset_id=asset_id,
+        structure_type=LegalStructure.TRUST,
+        jurisdiction="Delaware, United States",
+        token_supply=token_supply,
+    )
+
+    price_per_token = total_value / Decimal(str(token_supply))
+    kv("Wrapper ID:", str(wrapper_id)[:12] + "...")
+    kv("Structure:", LegalStructure.TRUST.value)
+    kv("Token Supply:", f"{token_supply:,}")
+    kv("Price Per Token:", f"${price_per_token:.2f}")
+    kv("Asset Status:", AssetStatus.PENDING_AUDIT.value)
+
+    # ---- Step 3: Onboard Investors ----
+    header(3, "Onboard Investors (KYC/AML)")
+
+    # Manually advance asset to tokenized so minting works
+    db.tables[f"asset:{asset_id}"].status = (
+        AssetStatus.TOKENIZED.value
+    )
+
+    investors = [
+        ("Citadel Securities", Decimal("50000000"),
+         "0xCITA" + uuid.uuid4().hex[:36]),
+        ("Fidelity Investments", Decimal("25000000"),
+         "0xFIDL" + uuid.uuid4().hex[:36]),
+        ("Goldman Sachs Asset Mgmt", Decimal("10000000"),
+         "0xGSAM" + uuid.uuid4().hex[:36]),
+    ]
+
+    investor_records = []
+    for name, amount, wallet in investors:
+        investor_id = uuid.uuid4()
+        compliance_id = kyc_svc.onboard_investor(
+            investor_id=investor_id,
+            wallet_address=wallet,
+            jurisdiction="United States",
+            investor_tier=InvestorTier.INSTITUTIONAL,
+            idempotency_key=f"onboard-{investor_id}",
+        )
+        investor_records.append(
+            (name, investor_id, wallet, amount, compliance_id)
+        )
+        kv(f"{name}:", "")
+        kv("  Investor ID:", str(investor_id)[:12] + "...")
+        kv("  Wallet:", wallet[:16] + "...")
+        kv("  Investment:", f"${amount:,.2f}")
+        kv("  KYC Status:", ComplianceStatus.APPROVED.value)
+        kv("  Compliance ID:", str(compliance_id)[:12] + "...")
+        print()
+
+    # ---- Step 4: Mint Tokens ----
+    header(4, "Mint Tokens to Investor Wallets")
+
+    mint_records = []
+    for name, inv_id, wallet, amount, _ in investor_records:
+        token_amount = int(amount)
+        mint = mint_svc.mint_tokens(
+            asset_id=asset_id,
+            investor_id=inv_id,
+            wallet_address=wallet,
+            token_amount=token_amount,
+            fiat_received=amount,
+            idempotency_key=f"mint-{inv_id}",
+        )
+        mint_records.append((name, inv_id, wallet, token_amount, mint))
+        kv(f"{name}:", "")
+        kv("  Tokens Minted:", f"{token_amount:,}")
+        kv("  Fiat Received:", f"${amount:,.2f}")
+        kv("  Mint Status:", MintStatus.PENDING.value)
+        print()
+
+    supply = db.tables.get(f"supply:{asset_id}")
+    kv("Total Minted Supply:",
+       f"{Decimal(supply.minted_supply):,.0f} / "
+       f"{Decimal(supply.total_supply):,.0f}")
+
+    # ---- Step 5: Calculate Daily Yield ----
+    header(5, "Calculate Daily Yield (5% APY Rebase)")
+
+    annual_rate = Decimal("0.05")
+    daily_rate = annual_rate / Decimal("365")
+    daily_yield = total_value * daily_rate
+
+    nav_id = nav_engine.calculate_and_distribute_yield(
+        asset_id=asset_id,
+        annual_yield_rate=annual_rate,
+        idempotency_key=f"nav-{asset_id}-day1",
+    )
+
+    kv("Annual Yield Rate:", "5.00%")
+    kv("Daily Yield Rate:", f"{daily_rate * 100:.5f}%")
+    kv("Fund Daily Yield:", f"${daily_yield:,.2f}")
+    print()
+    print("  Per-Investor Daily Yield:")
+    for name, _, _, amount, _ in investor_records:
+        inv_yield = amount * daily_rate
+        new_balance = amount + inv_yield
+        kv(f"  {name}:",
+           f"+${inv_yield:,.2f} -> "
+           f"${new_balance:,.2f}")
+
+    # ---- Step 6: Reconciliation ----
+    header(6, "Reconciliation (On-Chain vs Ledger)")
+
+    result = recon_engine.reconcile_asset(asset_id)
+    internal_supply = supply.minted_supply
+    onchain_supply = blockchain_svc.get_total_supply(asset_id)
+    custodian_nav = custodian_api.get_nav(asset_id)
+    asset_obj = db.tables.get(f"asset:{asset_id}")
+
+    kv("Internal Supply:", f"{Decimal(internal_supply):,.0f}")
+    kv("On-Chain Supply:", f"{onchain_supply:,.0f}")
+    kv("Supply Match:", "YES" if result else "NO")
+    kv("Internal NAV:", f"${Decimal(asset_obj.total_value):,.2f}")
+    kv("Custodian NAV:", f"${custodian_nav:,.2f}")
+    kv("NAV Match:", "YES" if result else "NO")
+    kv("Reconciliation:", "PASSED" if result else "FAILED")
+
+    # ---- Step 7: Redemption ----
+    header(7, "Redemption (Goldman Redeems 5M Tokens)")
+
+    gs_name, gs_id, gs_wallet, gs_amount, _ = investor_records[2]
+    redeem_amount = 5_000_000
+
+    redemption_id = redemption_svc.request_redemption(
+        asset_id=asset_id,
+        investor_id=gs_id,
+        wallet_address=gs_wallet,
+        token_amount=redeem_amount,
+        bank_account="CHASE-WIRE-****7890",
+        idempotency_key=f"redeem-{gs_id}",
+    )
+
+    fiat_out = Decimal(str(redeem_amount)) * price_per_token
+    kv("Investor:", gs_name)
+    kv("Tokens Redeemed:", f"{redeem_amount:,}")
+    kv("Fiat Returned:", f"${fiat_out:,.2f}")
+    kv("Wire Destination:", "CHASE-WIRE-****7890")
+    kv("Redemption Status:", RedemptionStatus.PENDING.value)
+    kv("Redemption ID:", str(redemption_id)[:12] + "...")
+
+    # -- Summary --
+    print(f"\n{'=' * 60}")
+    print("  Simulation Complete")
+    print(f"{'=' * 60}")
+    print(f"  Asset:           {asset_name}")
+    print(f"  Investors:       {len(investor_records)}")
+    print(f"  Tokens Minted:   {Decimal(supply.minted_supply):,.0f}")
+    print(f"  Fund NAV:        ${Decimal(asset_obj.total_value):,.2f}")
+    print(f"  Outbox Events:   {len(db.events)}")
+    print(f"{'=' * 60}\n")
