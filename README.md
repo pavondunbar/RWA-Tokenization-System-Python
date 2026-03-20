@@ -501,10 +501,10 @@ RWA-Tokenization-System-Python/
 
 ---
 
-## License
+## 📄 License
 
-This project is provided as-is for educational and reference purposes. Please review the repository's license file before use.
+This project is licensed under the [MIT License](LICENSE).
 
 ---
 
-*Built by [Pavon Dunbar](https://linktr.ee/pavondunbar)*
+*Built with ♥️ by [Pavon Dunbar](https://linktr.ee/pavondunbar)*
