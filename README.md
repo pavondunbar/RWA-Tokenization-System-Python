@@ -1,6 +1,6 @@
-# 🏦 Real World Asset (RWA) Tokenization System (Python)
+# Real World Asset (RWA) Tokenization System (Python)
 
-> ⚠️ **SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION**
+> **SANDBOX / EDUCATIONAL USE ONLY — NOT FOR PRODUCTION**
 > This codebase is a reference implementation designed for learning, prototyping, and architectural exploration. It is **not audited, not legally reviewed, and must not be used to tokenize, manage, or transfer real assets or investor capital.** See the [Production Warning](#-production-warning) section for full details.
 
 ---
@@ -22,7 +22,7 @@
 
 ---
 
-## 📖 Overview
+## Overview
 
 The **RWA Tokenization System** is a Python-based reference implementation that models the full lifecycle of tokenizing a real-world asset — from initial registration through legal structuring, investor onboarding, token minting, daily yield distribution, redemption, and on-chain/off-chain reconciliation.
 
@@ -30,12 +30,12 @@ The system is modeled closely on how institutional-grade tokenization platforms 
 
 | Component | File | Responsibility |
 |---|---|---|
-| Core Services | `rwa_tokenization.py` | All service classes — registration through reconciliation |
-| Database Schema & Demo | `rwa_tokenization.sql` | PostgreSQL schema, indexes, and a full BUIDL-style walkthrough |
+| Core Services | `rwa-tokenization.py` | All service classes — registration through reconciliation |
+| Database Schema | `rwa-tokenization.sql` | PostgreSQL schema and indexes |
 
 ---
 
-## 🌍 What is RWA Tokenization?
+## What is RWA Tokenization?
 
 **Real World Asset tokenization** is the process of representing ownership of a physical or traditional financial asset as a digital token on a blockchain. Examples include:
 
@@ -48,7 +48,7 @@ Unlike permissionless DeFi tokens, RWA tokens are **regulated securities**. Ever
 
 ---
 
-## 🏗 Architecture
+## Architecture
 
 ```
                     ┌────────────────────────────────────────────────────┐
@@ -94,7 +94,7 @@ Unlike permissionless DeFi tokens, RWA tokens are **regulated securities**. Ever
 
 ---
 
-## ⚙️ Core Services
+## Core Services
 
 ### `RWARegistry`
 The entry point for any new tokenized asset. Validates that the custodian is licensed and approved, writes the asset record and an outbox event atomically, and begins the asset at `PENDING_LEGAL` status. Idempotency is enforced at the registration key level, preventing the same asset from ever being registered twice.
@@ -118,42 +118,42 @@ The inverse of minting. Manages the full redemption lifecycle: verifying the inv
 Daily audit engine that cross-checks four sources of truth: the internal ledger vs. on-chain token supply, the fund NAV vs. the custodian's reported assets under management, and a scan for tokens held by non-whitelisted wallets. Any discrepancy immediately triggers a critical alert and halts all new minting and redemptions until the mismatch is resolved.
 
 ### `RWAOutboxPublisher`
-Async background poller that delivers `outbox_events` to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe multi-instance operation. Marks each event `published_at` only after successful Kafka delivery, ensuring exactly-once delivery semantics even across crashes and restarts.
+Background poller that delivers `outbox_events` to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe multi-instance operation. Marks each event `published_at` only after successful Kafka delivery, ensuring exactly-once delivery semantics even across crashes and restarts.
 
 ---
 
-## ✨ Key Features & Design Patterns
+## Key Features & Design Patterns
 
-### ✅ Full Asset Lifecycle State Machine
+### Full Asset Lifecycle State Machine
 Assets progress through a strict sequence: `PENDING_LEGAL → PENDING_AUDIT → APPROVED → TOKENIZED → REDEEMED`. State guards at each transition prevent operations from running out of order — you cannot mint tokens for an asset that hasn't cleared legal review.
 
-### ✅ Permissioned Transfers (ERC-1400 Pattern)
+### Permissioned Transfers (ERC-1400 Pattern)
 Unlike standard ERC-20 tokens, RWA tokens enforce transfer restrictions at the smart contract level. The `can_transfer()` check gates every token movement — both sender and receiver must appear in `whitelisted_wallets`. This mirrors how ERC-1400 security token standards work in production systems like Securitize and Tokeny.
 
-### ✅ KYC Expiry with Mandatory Re-verification
+### KYC Expiry with Mandatory Re-verification
 Every investor compliance record carries an `expires_at` timestamp. When KYC expires, `revoke_whitelist()` removes the wallet from the whitelist and blocks all future transfers. This models the annual re-verification requirement imposed by regulated platforms handling securities.
 
-### ✅ Idempotency at Every Layer
+### Idempotency at Every Layer
 Each service method checks for an existing `idempotency_key` before any side effect. This covers: asset registration, investor onboarding, token minting, NAV calculations, and redemptions. Re-submitted requests return the original result with no duplicate operations.
 
-### ✅ Pessimistic Locking on Token Supply
+### Pessimistic Locking on Token Supply
 The `rwa_token_supply` row is locked with `SELECT ... FOR UPDATE` before every mint, preventing two concurrent investments from both seeing sufficient supply and both succeeding — the exact double-mint race condition that has caused real losses on production token platforms.
 
-### ✅ Transactional Outbox Pattern (All Services)
+### Transactional Outbox Pattern (All Services)
 Every service writes its outbox event in the **same database transaction** as the business record. This eliminates the dual-write problem across all six services. The `RWAOutboxPublisher` delivers events to Kafka only after they are safely committed to Postgres, so downstream services (investor dashboards, compliance systems, on-chain oracles) never miss an event even if the application crashes.
 
-### ✅ Atomic Ledger Settlement
+### Atomic Ledger Settlement
 Token supply updates (`minted_supply += amount`) and record creation are always co-located in the same transaction. During redemption, the supply release and settlement status update are committed together or not at all — the ledger never shows tokens as both outstanding and redeemed.
 
-### ✅ Reconciliation as a Hard Stop
+### Reconciliation as a Hard Stop
 The `RWAReconciliationEngine` treats any discrepancy between internal state and on-chain reality as an emergency, not a warning. Minting and redemptions are halted immediately, ensuring financial integrity is never traded off against operational continuity.
 
-### ✅ Decimal Precision for Financial Arithmetic
+### Decimal Precision for Financial Arithmetic
 All token amounts and monetary values use Python's `Decimal` type rather than floats, preventing IEEE 754 rounding errors from corrupting financial calculations — a mandatory requirement in any system handling currency.
 
 ---
 
-## 🗄 Database Schema
+## Database Schema
 
 ### `rwa_assets`
 The root record for every tokenized asset.
@@ -162,7 +162,9 @@ The root record for every tokenized asset.
 |---|---|---|
 | `id` | UUID | Primary key |
 | `type` | VARCHAR(20) | `real_estate`, `treasury_bond`, `private_equity`, `commodity`, `fund` |
+| `name` | VARCHAR(256) | Human-readable asset name |
 | `total_value` | DECIMAL(38,18) | Current AUM / asset value (updated daily on yield accrual) |
+| `jurisdiction` | VARCHAR(64) | Legal jurisdiction of the asset |
 | `custodian` | VARCHAR(256) | Licensed custodian holding the underlying asset |
 | `status` | VARCHAR(20) | Asset lifecycle state |
 | `idempotency_key` | VARCHAR(256) UNIQUE | Prevents duplicate registration |
@@ -172,25 +174,36 @@ The legal entity bridging off-chain ownership to on-chain tokens.
 
 | Column | Type | Description |
 |---|---|---|
+| `id` | UUID | Primary key |
+| `asset_id` | UUID | Foreign key to `rwa_assets` |
 | `structure_type` | VARCHAR(20) | `SPV`, `TRUST`, `LLC`, `FUND` |
+| `jurisdiction` | VARCHAR(64) | Legal jurisdiction of the entity |
 | `token_supply` | DECIMAL(38,18) | Maximum number of tokens that can be minted |
 | `price_per_token` | DECIMAL(38,18) | `total_value / token_supply` at issuance |
+| `status` | VARCHAR(20) | Wrapper status |
 
 ### `investor_compliance`
 KYC/AML record per investor, tied to a specific wallet address.
 
 | Column | Type | Description |
 |---|---|---|
+| `id` | UUID | Primary key |
+| `investor_id` | UUID | Investor identifier |
+| `wallet_address` | VARCHAR(256) | On-chain Ethereum address |
 | `tier` | VARCHAR(20) | `retail`, `accredited`, `qualified`, `institutional` |
-| `kyc_reference` | VARCHAR(256) | Reference ID from KYC provider (e.g., Securitize) |
-| `expires_at` | TIMESTAMP | When KYC expires — re-verification required |
+| `jurisdiction` | VARCHAR(64) | Investor's legal jurisdiction |
 | `status` | VARCHAR(20) | `pending`, `approved`, `rejected`, `expired` |
+| `kyc_reference` | VARCHAR(256) | Reference ID from KYC provider (e.g., Securitize) |
+| `idempotency_key` | VARCHAR(256) UNIQUE | Prevents duplicate onboarding |
+| `expires_at` | TIMESTAMP | When KYC expires — re-verification required |
 
 ### `whitelisted_wallets`
 The gate for all token transfers. Every row is a wallet address that may legally hold and transfer tokens.
 
 | Column | Type | Description |
 |---|---|---|
+| `id` | UUID | Primary key |
+| `investor_id` | UUID | Foreign key to investor |
 | `wallet_address` | VARCHAR(256) UNIQUE | On-chain Ethereum address |
 | `tier` | VARCHAR(20) | Investor classification |
 
@@ -199,22 +212,70 @@ A record for every token issuance event.
 
 | Column | Type | Description |
 |---|---|---|
+| `id` | UUID | Primary key |
+| `asset_id` | UUID | Foreign key to `rwa_assets` |
+| `investor_id` | UUID | Investor receiving tokens |
+| `wallet_address` | VARCHAR(256) | Destination wallet address |
 | `token_amount` | DECIMAL(38,18) | Number of tokens issued |
 | `fiat_received` | DECIMAL(38,18) | USD amount wired by investor |
+| `status` | VARCHAR(20) | Mint lifecycle state |
+| `tx_hash` | VARCHAR(256) | On-chain transaction hash |
+| `block_number` | BIGINT | Ethereum block number |
+| `idempotency_key` | VARCHAR(256) UNIQUE | Prevents duplicate mints |
 | `confirmed_at` | TIMESTAMP | NULL = in-flight; NOT NULL = confirmed on-chain |
+
+### `rwa_token_supply`
+Tracks minted vs. total supply per asset with pessimistic locking.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `asset_id` | UUID UNIQUE | Foreign key to `rwa_assets` (one row per asset) |
+| `total_supply` | DECIMAL(38,18) | Maximum token supply |
+| `minted_supply` | DECIMAL(38,18) | Currently minted tokens (default 0) |
+
+### `nav_calculations`
+Daily NAV snapshots and yield calculations.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `asset_id` | UUID | Foreign key to `rwa_assets` |
+| `total_value` | DECIMAL(38,18) | Fund value at time of calculation |
+| `daily_yield` | DECIMAL(38,18) | Yield amount for the day |
+| `yield_rate` | DECIMAL(38,18) | Annual yield rate used |
+| `calculated_at` | TIMESTAMP | When the calculation was performed |
+| `idempotency_key` | VARCHAR(256) UNIQUE | One calculation per asset per day |
+
+### `token_redemptions`
+Tracks the full redemption lifecycle from request to fiat settlement.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `asset_id` | UUID | Foreign key to `rwa_assets` |
+| `investor_id` | UUID | Investor redeeming tokens |
+| `wallet_address` | VARCHAR(256) | Source wallet address |
+| `token_amount` | DECIMAL(38,18) | Number of tokens being redeemed |
+| `bank_account` | VARCHAR(256) | Fiat destination for wire transfer |
+| `status` | VARCHAR(20) | Redemption lifecycle state |
+| `idempotency_key` | VARCHAR(256) UNIQUE | Prevents duplicate redemptions |
+| `settled_at` | TIMESTAMP | NULL until fiat wire completes |
 
 ### `outbox_events`
 Reliable event delivery buffer — shared across all services.
 
 | Column | Type | Description |
 |---|---|---|
-| `event_type` | VARCHAR(64) | e.g. `rwa.registered`, `token.mint_confirmed`, `nav.yield_calculated` |
+| `id` | UUID | Primary key |
+| `aggregate_id` | VARCHAR(256) | ID of the entity that produced the event |
+| `event_type` | VARCHAR(256) | e.g. `rwa.registered`, `token.mint_confirmed`, `nav.yield_calculated` |
 | `payload` | JSONB | Full event data |
 | `published_at` | TIMESTAMP | NULL = pending Kafka delivery |
 
 ---
 
-## 🔁 State Machines
+## State Machines
 
 ### Asset Status
 ```
@@ -261,15 +322,15 @@ Reliable event delivery buffer — shared across all services.
 
 ---
 
-## 🏢 Real-World Example: BlackRock BUIDL
+## Real-World Example: BlackRock BUIDL
 
-The SQL demo in `rwa_tokenization.sql` is modeled directly on the **BlackRock USD Institutional Digital Liquidity Fund (BUIDL)**, the largest tokenized money market fund with over **$2.9B AUM** as of 2024. The sandbox scenario uses a fictional equivalent called the **Blackstone Treasury Token Fund (BTTF)** with $500M AUM.
+The Python demo in `rwa-tokenization.py` is modeled directly on the **BlackRock USD Institutional Digital Liquidity Fund (BUIDL)**, the largest tokenized money market fund with over **$2.9B AUM** as of 2024. The sandbox scenario uses a fictional equivalent called the **Blackstone Treasury Token Fund (BTTF)** with $500M AUM.
 
 | Real-World Attribute | BUIDL (BlackRock) | BTTF (This Demo) |
 |---|---|---|
 | Underlying asset | US Treasury Bills | US Treasury Bills |
 | Legal structure | Delaware Trust | Delaware Trust |
-| Custodian | BNY Mellon | BNY Mellon Digital Assets |
+| Custodian | BNY Mellon | BNY Mellon |
 | Token price | $1.00 (stable NAV) | $1.00 |
 | Total supply | 2.9B tokens | 500M tokens |
 | Yield mechanism | Daily token rebase | Daily token rebase |
@@ -278,7 +339,7 @@ The SQL demo in `rwa_tokenization.sql` is modeled directly on the **BlackRock US
 | Blockchain | Ethereum (ERC-1400) | Ethereum (ERC-1400) |
 | Transfer restriction | Whitelisted wallets | Whitelisted wallets |
 
-The SQL walkthrough mints tokens to three simulated institutional investors:
+The Python script mints tokens to three simulated institutional investors:
 
 | Investor | USD Wired | Tokens Minted |
 |---|---|---|
@@ -289,7 +350,7 @@ The SQL walkthrough mints tokens to three simulated institutional investors:
 
 ---
 
-## 🧪 Running in a Sandbox Environment
+## Running in a Sandbox Environment
 
 > These instructions are for **local/sandbox use only**. No real assets, KYC data, or investor funds are involved.
 
@@ -298,13 +359,12 @@ The SQL walkthrough mints tokens to three simulated institutional investors:
 - Python 3.10+
 - PostgreSQL 14+
 - A Kafka instance (local or Docker)
-- Optional: AWS SQS FIFO or a local mock (ElasticMQ) for the signing queue
 
 ### 1. Clone the Repository
 
 ```bash
-git clone https://github.com/pavondunbar/Crypto-Custody-Withdrawal-System-Python.git
-cd Crypto-Custody-Withdrawal-System-Python
+git clone https://github.com/pavondunbar/RWA-Tokenization-System-Python.git
+cd RWA-Tokenization-System-Python
 ```
 
 ### 2. Create a Virtual Environment
@@ -318,25 +378,26 @@ venv\Scripts\activate          # Windows
 ### 3. Install Dependencies
 
 ```bash
-pip install asyncpg aiokafka asyncio
+pip install psycopg2-binary kafka-python-ng
 ```
 
 ### 4. Set Up PostgreSQL
 
-Start a local PostgreSQL instance and create a sandbox database:
+Start a local PostgreSQL instance (or use Docker) and create a sandbox database:
 
 ```bash
-psql -U postgres -c "CREATE DATABASE rwa_sandbox;"
-psql -U postgres -d rwa_sandbox -f rwa_tokenization.sql
+# Using Docker
+docker run -d --name postgres \
+  -e POSTGRES_PASSWORD=postgres \
+  -p 5432:5432 \
+  postgres:16
+
+# Create the database and load the schema
+psql -U postgres -c "CREATE DATABASE rwa;"
+psql -U postgres -d rwa -f rwa-tokenization.sql
 ```
 
-The SQL file will:
-- Create all tables and indexes
-- Register the Blackstone Treasury Token Fund (BTTF)
-- Create a Delaware Trust legal wrapper ($1.00/token, 500M total supply)
-- Onboard and whitelist three institutional investors (Citadel, Fidelity, Goldman)
-- Mint tokens to all three investors
-- Run fund-level and investor-level verification queries
+The SQL file creates all tables and indexes. The Python script drives the full demo.
 
 ### 5. Start a Local Kafka (Docker)
 
@@ -347,118 +408,17 @@ docker run -d --name kafka \
   apache/kafka:latest
 ```
 
-### 6. Run the Outbox Publisher
+### 6. Run the Full Demo
 
-```python
-import asyncio
-import asyncpg
-from aiokafka import AIOKafkaProducer
-from rwa_tokenization import RWAOutboxPublisher
+The script's `__main__` block runs all eight steps end-to-end — asset registration, legal wrapper creation, investor onboarding, token minting, daily yield calculation, reconciliation, redemption, and outbox publishing to Kafka:
 
-async def main():
-    pool = await asyncpg.create_pool("postgresql://postgres@localhost/rwa_sandbox")
-    producer = AIOKafkaProducer(bootstrap_servers="localhost:9092")
-    await producer.start()
-
-    publisher = RWAOutboxPublisher(db=pool, kafka_producer=producer)
-    await publisher.run_forever(poll_interval=1)
-
-asyncio.run(main())
+```bash
+python3 rwa-tokenization.py
 ```
 
-### 7. Exercise the Core Services with Stubs
+If Kafka is not running, the script falls back to a no-op queue and prints a warning. All database operations still execute normally.
 
-```python
-from decimal import Decimal
-from rwa_tokenization import (
-    RWARegistry, LegalWrapperService, KYCComplianceService,
-    TokenMintingService, NAVCalculationEngine,
-    AssetType, LegalStructure, InvestorTier
-)
-
-# Stub implementations for sandbox use
-class StubDB:
-    # Implement query/execute/transaction backed by local psycopg2
-    pass
-
-class StubCustodianRegistry:
-    def is_approved(self, custodian): return True
-
-class StubKYCProvider:
-    def verify(self, investor_id, tier):
-        class Result:
-            passed = True
-            reference_id = "KYC-SANDBOX-001"
-            expiry_date = "2026-01-01"
-        return Result()
-
-class StubSanctionsChecker:
-    def screen(self, investor_id, jurisdiction):
-        class Result:
-            is_sanctioned = False
-        return Result()
-
-class StubSigningQueue:
-    def send(self, **kwargs): print(f"[QUEUE] {kwargs}")
-
-db = StubDB()
-
-# 1. Register a treasury bond asset
-registry = RWARegistry(db, StubCustodianRegistry())
-asset = registry.register_asset(
-    asset_type=AssetType.TREASURY_BOND,
-    name="Sandbox T-Bill Fund",
-    total_value=Decimal("100000000"),
-    jurisdiction="Delaware, United States",
-    custodian="BNY Mellon",
-    idempotency_key="sandbox-asset-001"
-)
-
-# 2. Create a Delaware Trust legal wrapper
-legal_svc = LegalWrapperService(db)
-wrapper_id = legal_svc.create_legal_wrapper(
-    asset_id=asset.id,
-    structure_type=LegalStructure.TRUST,
-    jurisdiction="Delaware, United States",
-    token_supply=Decimal("100000000")   # $1.00/token
-)
-
-# 3. Onboard an institutional investor
-kyc_svc = KYCComplianceService(db, StubKYCProvider(), StubSanctionsChecker())
-compliance_id = kyc_svc.onboard_investor(
-    investor_id="investor-uuid-001",
-    wallet_address="0xSandboxWallet123",
-    jurisdiction="New York, United States",
-    investor_tier=InvestorTier.INSTITUTIONAL,
-    idempotency_key="kyc-sandbox-001"
-)
-
-# 4. Mint tokens on fiat wire receipt
-minting_svc = TokenMintingService(db, kyc_svc, StubSigningQueue())
-mint = minting_svc.mint_tokens(
-    asset_id=asset.id,
-    investor_id="investor-uuid-001",
-    wallet_address="0xSandboxWallet123",
-    token_amount=Decimal("5000000"),
-    fiat_received=Decimal("5000000"),
-    idempotency_key="mint-sandbox-001"
-)
-```
-
-### 8. Run the Daily NAV Calculation
-
-```python
-from rwa_tokenization import NAVCalculationEngine
-
-nav_engine = NAVCalculationEngine(db, oracle_service=None, signing_queue=StubSigningQueue())
-nav_engine.calculate_and_distribute_yield(
-    asset_id=asset.id,
-    annual_yield_rate=Decimal("0.05"),   # 5% T-bill yield
-    idempotency_key=f"nav-2025-01-15"    # one per day
-)
-```
-
-### 9. Verify the Final State
+### 7. Verify the Final State
 
 ```sql
 -- Fund overview
@@ -486,14 +446,21 @@ WHERE tm.status = 'confirmed'
 GROUP BY a.name, lw.token_supply;
 ```
 
+> **Note:** The demo inserts new rows on each run. To start fresh, truncate all tables before re-running:
+> ```sql
+> TRUNCATE rwa_assets, legal_wrappers, investor_compliance,
+>          whitelisted_wallets, token_mints, rwa_token_supply,
+>          nav_calculations, token_redemptions, outbox_events CASCADE;
+> ```
+
 ---
 
-## 📁 Project Structure
+## Project Structure
 
 ```
-Crypto-Custody-Withdrawal-System-Python/
+RWA-Tokenization-System-Python/
 │
-├── rwa_tokenization.py        # All service classes:
+├── rwa-tokenization.py        # All service classes:
 │                              #   RWARegistry
 │                              #   LegalWrapperService
 │                              #   KYCComplianceService
@@ -503,13 +470,14 @@ Crypto-Custody-Withdrawal-System-Python/
 │                              #   RWAReconciliationEngine
 │                              #   RWAOutboxPublisher
 │
-└── rwa_tokenization.sql       # PostgreSQL schema + BTTF end-to-end demo
-                               # (BUIDL-inspired: $500M fund, 3 investors)
+├── rwa-tokenization.sql       # PostgreSQL schema (tables + indexes)
+├── pyproject.toml             # Project metadata and dependencies
+└── LICENSE                    # License file
 ```
 
 ---
 
-## 🚨 Production Warning
+## Production Warning
 
 **This project is explicitly NOT suitable for production use.** Tokenizing and managing real-world assets is among the most regulated and legally complex activities in financial services. The following critical components are absent or stubbed:
 
@@ -533,10 +501,10 @@ Crypto-Custody-Withdrawal-System-Python/
 
 ---
 
-## 📄 License
+## License
 
 This project is provided as-is for educational and reference purposes. Please review the repository's license file before use.
 
 ---
 
-*Built with ♥️ by [Pavon Dunbar](https://linktr.ee/pavondunbar)*
+*Built by [Pavon Dunbar](https://linktr.ee/pavondunbar)*
