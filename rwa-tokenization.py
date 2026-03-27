@@ -1351,7 +1351,10 @@ class RWAOutboxPublisher:
 if __name__ == "__main__":
     from datetime import timedelta
 
-    DSN = "dbname=rwa user=postgres"
+    DSN = (
+        "host=localhost port=5433 "
+        "dbname=rwa user=ledger_user password=ledger_pass"
+    )
 
     # -- External service stubs --
 

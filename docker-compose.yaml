@@ -17,13 +17,15 @@ services:
       - ./db/init:/docker-entrypoint-initdb.d
     networks:
       - internal
+      - backend
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ledger_user -d rwa"]
       interval: 2s
       timeout: 3s
       retries: 10
       start_period: 5s
-    # No ports exposed — not reachable from host
+    ports:
+      - "5433:5432"
 
   # -----------------------------------------------
   # RWA Tokenization Service (ONLY DB WRITER)
