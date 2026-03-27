@@ -16,6 +16,11 @@
 - [State Machines](#-state-machines)
 - [Real-World Example: BlackRock BUIDL](#-real-world-example-blackrock-buidl)
 - [Running in a Sandbox Environment](#-running-in-a-sandbox-environment)
+- [Verifying the System](#-verifying-the-system)
+  - [Inspecting the PostgreSQL Database](#inspecting-the-postgresql-database)
+  - [Checking Kafka Messages](#checking-kafka-messages)
+  - [Viewing Outbox Publisher Logs](#viewing-outbox-publisher-logs)
+  - [Viewing All Container Logs](#viewing-all-container-logs)
 - [Project Structure](#-project-structure)
 - [Production Warning](#-production-warning)
 - [License](#-license)
@@ -365,9 +370,8 @@ The Python script mints tokens to three simulated institutional investors:
 
 ### Prerequisites
 
-- Python 3.10+
-- PostgreSQL 14+
-- A Kafka instance (local or Docker)
+- Docker and Docker Compose
+- Python 3.10+ (for running the script on the host — optional if running only via Docker)
 
 ### 1. Clone the Repository
 
@@ -376,112 +380,383 @@ git clone https://github.com/pavondunbar/RWA-Tokenization-System-Python.git
 cd RWA-Tokenization-System-Python
 ```
 
-### 2. Create a Virtual Environment
+### 2. Start the Docker Compose Stack
+
+The stack launches PostgreSQL, Kafka, Zookeeper, the RWA service, the outbox publisher, a signing gateway, and three MPC nodes across three isolated trust-domain networks:
 
 ```bash
-python3 -m venv venv
-source venv/bin/activate       # macOS/Linux
-venv\Scripts\activate          # Windows
+docker-compose up -d
 ```
 
-### 3. Install Dependencies
+Wait for all containers to reach a healthy/running state:
+
+```bash
+docker-compose ps
+```
+
+You should see all 9 containers running:
+
+| Container | Role |
+|---|---|
+| `rwa-ledger-db` | PostgreSQL 16 (append-only ledger) |
+| `rwa-kafka` | Kafka broker |
+| `rwa-zookeeper` | Zookeeper (Kafka dependency) |
+| `rwa-service` | Runs the full demo lifecycle on startup |
+| `rwa-outbox-publisher` | Polls outbox events and publishes to Kafka |
+| `rwa-signing-gateway` | Bridge between backend and signing domain |
+| `rwa-mpc-node-1` | MPC signing node 1 |
+| `rwa-mpc-node-2` | MPC signing node 2 |
+| `rwa-mpc-node-3` | MPC signing node 3 |
+
+### 3. Run the Demo Script (Host)
+
+If you want to run the demo from the host machine (outside Docker), install dependencies and run:
 
 ```bash
 pip install psycopg2-binary kafka-python-ng
-```
-
-### 4. Set Up PostgreSQL
-
-Start a local PostgreSQL instance (or use Docker) and create a sandbox database:
-
-```bash
-# Using Docker
-docker run -d --name postgres \
-  -e POSTGRES_PASSWORD=postgres \
-  -p 5432:5432 \
-  postgres:16
-
-# Create the database and load the schema
-psql -U postgres -c "CREATE DATABASE rwa;"
-psql -U postgres -d rwa -f rwa-tokenization.sql
-```
-
-The SQL file creates all tables and indexes. The Python script drives the full demo.
-
-### 5. Start a Local Kafka (Docker)
-
-```bash
-docker run -d --name kafka \
-  -p 9092:9092 \
-  -e KAFKA_ADVERTISED_LISTENERS=PLAINTEXT://localhost:9092 \
-  apache/kafka:latest
-```
-
-### 6. Run the Full Demo
-
-The script's `__main__` block runs all eight steps end-to-end — asset registration, legal wrapper creation, investor onboarding, token minting, daily yield calculation, reconciliation, redemption, and outbox publishing to Kafka:
-
-```bash
 python3 rwa-tokenization.py
 ```
 
-If Kafka is not running, the script falls back to a no-op queue and prints a warning. All database operations still execute normally.
+The script connects to PostgreSQL on `localhost:5433` and runs all eight steps end-to-end — asset registration, legal wrapper creation, investor onboarding, token minting, daily yield calculation, reconciliation, redemption, and outbox publishing.
 
-### 7. Verify the Final State
+If Kafka is not reachable from the host, the script falls back to a no-op queue and prints a warning. All database operations still execute normally.
+
+### 4. Tear Down and Reset
+
+To stop all containers and destroy all data (volumes):
+
+```bash
+docker-compose down -v
+```
+
+To restart fresh:
+
+```bash
+docker-compose down -v && docker-compose up -d
+```
+
+---
+
+## Verifying the System
+
+After running the demo, you can inspect every layer of the system — the PostgreSQL ledger, Kafka event streams, and outbox publisher logs.
+
+### Inspecting the PostgreSQL Database
+
+Connect to the database from the host using `psql` or any SQL client. The database is exposed on port **5433**:
+
+```bash
+psql -h localhost -p 5433 -U ledger_user -d rwa
+```
+
+Password: `ledger_pass`
+
+Or use `docker exec` to connect from inside the container:
+
+```bash
+docker exec -it rwa-ledger-db psql -U ledger_user -d rwa
+```
+
+#### Fund Overview
 
 ```sql
--- Fund overview
 SELECT a.name, a.total_value, a.custodian,
        lw.structure_type, lw.token_supply, lw.price_per_token
 FROM rwa_assets a
 JOIN legal_wrappers lw ON lw.asset_id = a.id;
-
--- Investor positions
-SELECT ic.wallet_address, ic.tier, tm.token_amount,
-       tm.fiat_received, tm.status, tm.confirmed_at
-FROM investor_compliance ic
-JOIN token_mints tm ON tm.investor_id = ic.investor_id
-ORDER BY tm.token_amount DESC;
-
--- Fund subscription summary
-SELECT a.name, lw.token_supply,
-       SUM(tm.token_amount) AS tokens_minted,
-       lw.token_supply - SUM(tm.token_amount) AS tokens_remaining,
-       ROUND((SUM(tm.token_amount) / lw.token_supply) * 100, 2) AS percent_subscribed
-FROM rwa_assets a
-JOIN legal_wrappers lw ON lw.asset_id = a.id
-JOIN token_mints tm ON tm.asset_id = a.id
-WHERE tm.status = 'confirmed'
-GROUP BY a.name, lw.token_supply;
 ```
 
-> **Note:** The demo inserts new rows on each run. To start fresh, truncate all tables before re-running:
-> ```sql
-> TRUNCATE rwa_assets, legal_wrappers, investor_compliance,
->          whitelisted_wallets, token_mints, rwa_token_supply,
->          nav_calculations, token_redemptions, outbox_events CASCADE;
-> ```
+#### Investor Compliance Records
+
+```sql
+SELECT investor_id, wallet_address, tier, jurisdiction, expires_at
+FROM investor_compliance
+ORDER BY created_at;
+```
+
+#### Whitelisted Wallets (Active)
+
+```sql
+SELECT * FROM v_active_whitelists;
+```
+
+#### Token Mint Records
+
+```sql
+SELECT tm.investor_id, tm.wallet_address, tm.token_amount,
+       tm.fiat_received, cs.current_state AS status
+FROM token_mints tm
+JOIN v_current_state cs
+  ON cs.entity_type = 'mint' AND cs.entity_id = tm.id
+ORDER BY tm.token_amount DESC;
+```
+
+#### State Transition History
+
+Every state change in the system is recorded as an append-only event. Query the full audit trail:
+
+```sql
+SELECT entity_type, entity_id, from_state, to_state, created_at
+FROM state_transitions
+ORDER BY created_at;
+```
+
+Or view only the current state of each entity:
+
+```sql
+SELECT * FROM v_current_state ORDER BY entity_type, created_at;
+```
+
+#### Double-Entry Ledger
+
+Every financial operation produces balanced debit/credit entries. View the full journal:
+
+```sql
+SELECT asset_id, entry_type, debit_account, credit_account,
+       amount, reference_id, created_at
+FROM ledger_entries
+ORDER BY created_at;
+```
+
+Verify the ledger balances (debits must equal credits):
+
+```sql
+SELECT entry_type,
+       SUM(amount) AS total_debits,
+       SUM(amount) AS total_credits,
+       SUM(amount) - SUM(amount) AS imbalance
+FROM ledger_entries
+GROUP BY entry_type;
+```
+
+#### Investor Balances (Derived from Ledger)
+
+Balances are not stored — they are computed from the append-only ledger entries:
+
+```sql
+SELECT * FROM v_investor_balance;
+```
+
+#### NAV / Yield Calculations
+
+```sql
+SELECT asset_id, total_value, daily_yield, yield_rate, calculated_at
+FROM nav_calculations
+ORDER BY calculated_at;
+```
+
+#### Current Asset Value (Initial + Accumulated Yield)
+
+```sql
+SELECT * FROM v_asset_current_value;
+```
+
+#### Token Redemptions
+
+```sql
+SELECT tr.investor_id, tr.wallet_address, tr.token_amount,
+       tr.bank_account, cs.current_state AS status
+FROM token_redemptions tr
+JOIN v_current_state cs
+  ON cs.entity_type = 'redemption' AND cs.entity_id = tr.id;
+```
+
+#### Outbox Events
+
+View all events written by the services:
+
+```sql
+SELECT id, event_type, aggregate_id, created_at
+FROM outbox_events
+ORDER BY created_at;
+```
+
+Check which events have been published to Kafka:
+
+```sql
+SELECT oe.id, oe.event_type, op.published_at
+FROM outbox_events oe
+JOIN outbox_published op ON op.event_id = oe.id
+ORDER BY op.published_at;
+```
+
+Check for any unpublished events (should be empty after the outbox publisher runs):
+
+```sql
+SELECT * FROM v_unpublished_events;
+```
+
+#### Append-Only Verification
+
+Every table is protected by an immutability trigger. You can verify that UPDATE and DELETE are blocked:
+
+```sql
+-- This will fail with: "Table rwa_assets is append-only.
+-- UPDATE and DELETE are prohibited."
+UPDATE rwa_assets SET name = 'test';
+```
+
+#### Full Table Counts
+
+Quick overview of how many records each table contains:
+
+```sql
+SELECT 'rwa_assets' AS table_name, COUNT(*) FROM rwa_assets
+UNION ALL SELECT 'legal_wrappers', COUNT(*) FROM legal_wrappers
+UNION ALL SELECT 'investor_compliance', COUNT(*) FROM investor_compliance
+UNION ALL SELECT 'whitelisted_wallets', COUNT(*) FROM whitelisted_wallets
+UNION ALL SELECT 'token_mints', COUNT(*) FROM token_mints
+UNION ALL SELECT 'nav_calculations', COUNT(*) FROM nav_calculations
+UNION ALL SELECT 'token_redemptions', COUNT(*) FROM token_redemptions
+UNION ALL SELECT 'state_transitions', COUNT(*) FROM state_transitions
+UNION ALL SELECT 'ledger_entries', COUNT(*) FROM ledger_entries
+UNION ALL SELECT 'outbox_events', COUNT(*) FROM outbox_events
+UNION ALL SELECT 'outbox_published', COUNT(*) FROM outbox_published;
+```
+
+### Checking Kafka Messages
+
+#### List All Kafka Topics
+
+The outbox publisher creates topics with the naming pattern `rwa.<event_type>`:
+
+```bash
+docker exec rwa-kafka kafka-topics \
+  --bootstrap-server localhost:9092 --list
+```
+
+Expected topics after a full demo run include:
+
+| Topic | Source |
+|---|---|
+| `rwa.rwa.registered` | Asset registration |
+| `rwa.investor.onboarded` | KYC/AML approval |
+| `rwa.token.mint_requested` | Token mint initiated |
+| `rwa.token.mint_confirmed` | On-chain mint confirmed |
+| `rwa.nav.yield_calculated` | Daily yield distribution |
+| `rwa.token.redemption_requested` | Redemption initiated |
+| `rwa.token.redemption_settled` | Fiat wire completed |
+
+#### Read Messages from a Specific Topic
+
+```bash
+docker exec rwa-kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --topic rwa.rwa.registered \
+  --from-beginning --timeout-ms 5000
+```
+
+#### Read Messages from All Topics
+
+To consume messages from all `rwa.*` topics:
+
+```bash
+docker exec rwa-kafka kafka-console-consumer \
+  --bootstrap-server localhost:9092 \
+  --whitelist 'rwa\..*' \
+  --from-beginning --timeout-ms 5000
+```
+
+#### Check Topic Details (Partitions, Offsets)
+
+```bash
+docker exec rwa-kafka kafka-topics \
+  --bootstrap-server localhost:9092 \
+  --describe --topic rwa.rwa.registered
+```
+
+### Viewing Outbox Publisher Logs
+
+The outbox publisher logs every event it delivers to Kafka:
+
+```bash
+docker logs rwa-outbox-publisher
+```
+
+Follow the logs in real time:
+
+```bash
+docker logs -f rwa-outbox-publisher
+```
+
+Expected output shows each event being picked up and published:
+
+```
+OutboxPublisher started — polling for events...
+2024-01-01 00:00:00,000 INFO __main__: Found 11 unpublished event(s)
+2024-01-01 00:00:00,001 INFO __main__: Published event <uuid> -> rwa.rwa.registered
+2024-01-01 00:00:00,002 INFO __main__: Published event <uuid> -> rwa.investor.onboarded
+...
+```
+
+### Viewing All Container Logs
+
+#### RWA Service (Full Demo Output)
+
+The `rwa-service` container runs the full eight-step demo on startup:
+
+```bash
+docker logs rwa-service
+```
+
+#### Signing Gateway
+
+```bash
+docker logs rwa-signing-gateway
+```
+
+#### MPC Nodes
+
+```bash
+docker logs rwa-mpc-node-1
+docker logs rwa-mpc-node-2
+docker logs rwa-mpc-node-3
+```
+
+#### All Containers at Once
+
+```bash
+docker-compose logs
+```
+
+Follow all logs in real time:
+
+```bash
+docker-compose logs -f
+```
 
 ---
 
 ## Project Structure
 
 ```
-RWA-Tokenization-System-Python/
+RWA-PYTHON/
 │
-├── rwa-tokenization.py        # All service classes:
-│                              #   RWARegistry
-│                              #   LegalWrapperService
-│                              #   KYCComplianceService
-│                              #   TokenMintingService
-│                              #   NAVCalculationEngine
-│                              #   TokenRedemptionService
-│                              #   RWAReconciliationEngine
-│                              #   RWAOutboxPublisher
+├── docker-compose.yaml            # Full stack: DB, Kafka, services, signing
+├── rwa-tokenization.py            # Host-runnable demo (all service classes)
+├── rwa-tokenization.sql           # PostgreSQL schema (tables + indexes)
+├── pyproject.toml                 # Project metadata and dependencies
+├── LICENSE                        # License file
 │
-├── rwa-tokenization.sql       # PostgreSQL schema (tables + indexes)
-├── pyproject.toml             # Project metadata and dependencies
-└── LICENSE                    # License file
+├── db/init/
+│   ├── 001-schema.sql             # Auto-loaded by Postgres on first boot
+│   └── 002-readonly-user.sql      # Restricted user for outbox publisher
+│
+├── rwa-service/
+│   ├── Dockerfile
+│   └── rwa-service.py             # Containerized demo (same logic)
+│
+├── outbox/
+│   ├── Dockerfile
+│   └── outbox-publisher.py        # Polls outbox_events, publishes to Kafka
+│
+├── signing-gateway/
+│   ├── Dockerfile
+│   └── gateway.py                 # 2-of-3 MPC threshold signing coordinator
+│
+└── mpc/
+    ├── Dockerfile
+    └── node.py                    # Individual MPC signing node
 ```
 
 ---
