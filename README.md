@@ -118,7 +118,7 @@ The inverse of minting. Manages the full redemption lifecycle: verifying the inv
 Daily audit engine that cross-checks four sources of truth: the internal ledger vs. on-chain token supply, the fund NAV vs. the custodian's reported assets under management, and a scan for tokens held by non-whitelisted wallets. Any discrepancy immediately triggers a critical alert and halts all new minting and redemptions until the mismatch is resolved.
 
 ### `RWAOutboxPublisher`
-Background poller that delivers `outbox_events` to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe multi-instance operation. Marks each event `published_at` only after successful Kafka delivery, ensuring exactly-once delivery semantics even across crashes and restarts.
+Background poller that delivers `outbox_events` to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe multi-instance operation. Records delivery by inserting into `outbox_published` (append-only — no `published_at` column on `outbox_events` itself), ensuring exactly-once delivery semantics even across crashes and restarts. Runs as a separate Docker service under a restricted `readonly_user` database role that holds only `SELECT` and `UPDATE` on `outbox_events` (UPDATE is required by PostgreSQL for `FOR UPDATE` row locking — the immutability trigger prevents actual data mutation), `SELECT` on `outbox_published`, and `INSERT` on `outbox_published`.
 
 ---
 
@@ -263,7 +263,7 @@ Tracks the full redemption lifecycle from request to fiat settlement.
 | `settled_at` | TIMESTAMP | NULL until fiat wire completes |
 
 ### `outbox_events`
-Reliable event delivery buffer — shared across all services.
+Reliable event delivery buffer — shared across all services. Append-only; delivery status is tracked in `outbox_published`.
 
 | Column | Type | Description |
 |---|---|---|
@@ -271,7 +271,16 @@ Reliable event delivery buffer — shared across all services.
 | `aggregate_id` | VARCHAR(256) | ID of the entity that produced the event |
 | `event_type` | VARCHAR(256) | e.g. `rwa.registered`, `token.mint_confirmed`, `nav.yield_calculated` |
 | `payload` | JSONB | Full event data |
-| `published_at` | TIMESTAMP | NULL = pending Kafka delivery |
+| `created_at` | TIMESTAMP | When the event was written |
+
+### `outbox_published`
+Tracks which outbox events have been delivered to Kafka. A row here means the event was successfully published. This replaces a mutable `published_at` column on `outbox_events`, keeping both tables append-only.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `event_id` | UUID UNIQUE | Foreign key to `outbox_events` |
+| `published_at` | TIMESTAMP | When Kafka delivery succeeded |
 
 ---
 

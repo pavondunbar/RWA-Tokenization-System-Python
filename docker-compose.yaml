@@ -1,0 +1,185 @@
+services:
+  # -----------------------------------------------
+  # PostgreSQL (LEDGER — HIGH TRUST, HARDENED)
+  # Lives ONLY on the internal network.
+  # No ports exposed to the host.
+  # -----------------------------------------------
+  postgres:
+    image: postgres:16
+    container_name: rwa-ledger-db
+    restart: always
+    environment:
+      POSTGRES_USER: ledger_user
+      POSTGRES_PASSWORD: ledger_pass
+      POSTGRES_DB: rwa
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    networks:
+      - internal
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ledger_user -d rwa"]
+      interval: 2s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+    # No ports exposed — not reachable from host
+
+  # -----------------------------------------------
+  # RWA Tokenization Service (ONLY DB WRITER)
+  # Runs the full demo lifecycle: register, legal
+  # wrapper, KYC, mint, NAV, reconciliation,
+  # redemption, and outbox publish.
+  # -----------------------------------------------
+  rwa-service:
+    build: ./rwa-service
+    container_name: rwa-service
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: rwa
+      DB_USER: ledger_user
+      DB_PASSWORD: ledger_pass
+      KAFKA_BROKER: kafka:9092
+    networks:
+      - backend
+      - internal
+    restart: on-failure
+
+  # -----------------------------------------------
+  # Outbox Publisher (RESTRICTED DB ACCESS)
+  # Polls unpublished events and delivers to Kafka.
+  # Uses a restricted DB user with SELECT + UPDATE
+  # on outbox_events (UPDATE for FOR UPDATE row
+  # locking only — immutability trigger blocks real
+  # mutations), SELECT on outbox_published, and
+  # INSERT on outbox_published.
+  # -----------------------------------------------
+  outbox-publisher:
+    build: ./outbox
+    container_name: rwa-outbox-publisher
+    depends_on:
+      postgres:
+        condition: service_healthy
+      kafka:
+        condition: service_started
+    environment:
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: rwa
+      DB_USER: readonly_user
+      DB_PASSWORD: readonly_pass
+      KAFKA_BROKER: kafka:9092
+    networks:
+      - backend
+      - internal
+    restart: on-failure
+
+  # -----------------------------------------------
+  # Zookeeper (Kafka dependency)
+  # -----------------------------------------------
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.5.0
+    container_name: rwa-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+    networks:
+      - backend
+
+  # -----------------------------------------------
+  # Kafka (Event streaming)
+  # -----------------------------------------------
+  kafka:
+    image: confluentinc/cp-kafka:7.5.0
+    container_name: rwa-kafka
+    depends_on:
+      - zookeeper
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_LISTENERS: PLAINTEXT://0.0.0.0:9092
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+    networks:
+      - backend
+    restart: always
+
+  # -----------------------------------------------
+  # Signing Gateway (BRIDGE: backend <-> signing)
+  # Only entry point into the signing trust domain.
+  # Fans out signing requests to MPC nodes and
+  # combines partial signatures (threshold 2-of-3).
+  # -----------------------------------------------
+  signing-gateway:
+    build: ./signing-gateway
+    container_name: rwa-signing-gateway
+    depends_on:
+      - mpc-node-1
+      - mpc-node-2
+      - mpc-node-3
+    environment:
+      MPC_NODES: "mpc-node-1:8001,mpc-node-2:8001,mpc-node-3:8001"
+    networks:
+      - backend     # receives signing requests
+      - signing     # talks to MPC nodes
+    restart: on-failure
+
+  # -----------------------------------------------
+  # MPC Node 1 (SIGNING DOMAIN ONLY)
+  # Unreachable from backend, DB, or host.
+  # -----------------------------------------------
+  mpc-node-1:
+    build: ./mpc
+    container_name: rwa-mpc-node-1
+    environment:
+      NODE_ID: 1
+    networks:
+      - signing
+    restart: on-failure
+
+  # -----------------------------------------------
+  # MPC Node 2 (SIGNING DOMAIN ONLY)
+  # -----------------------------------------------
+  mpc-node-2:
+    build: ./mpc
+    container_name: rwa-mpc-node-2
+    environment:
+      NODE_ID: 2
+    networks:
+      - signing
+    restart: on-failure
+
+  # -----------------------------------------------
+  # MPC Node 3 (SIGNING DOMAIN ONLY)
+  # -----------------------------------------------
+  mpc-node-3:
+    build: ./mpc
+    container_name: rwa-mpc-node-3
+    environment:
+      NODE_ID: 3
+    networks:
+      - signing
+    restart: on-failure
+
+# -----------------------------------------------
+# Trust Domain Networks
+# -----------------------------------------------
+networks:
+  # Inter-service communication
+  backend:
+
+  # Database isolation — only rwa-service and
+  # outbox-publisher can reach postgres
+  internal:
+    internal: true   # not reachable from host
+
+  # MPC signing isolation — only signing-gateway
+  # can reach MPC nodes
+  signing:
+    internal: true   # not reachable from host
+
+volumes:
+  postgres_data:
