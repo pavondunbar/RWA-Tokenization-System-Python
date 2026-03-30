@@ -1438,7 +1438,7 @@ if __name__ == "__main__":
     try:
         from kafka import KafkaProducer
         kafka_producer = KafkaProducer(
-            bootstrap_servers="localhost:9092",
+            bootstrap_servers="localhost:29092",
         )
         signing_queue = KafkaSigningQueue(kafka_producer)
     except Exception as exc:
