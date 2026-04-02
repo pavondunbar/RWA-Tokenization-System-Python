@@ -36,7 +36,11 @@ The system is modeled closely on how institutional-grade tokenization platforms 
 | Component | File | Responsibility |
 |---|---|---|
 | Core Services | `rwa-tokenization.py` | All service classes — registration through reconciliation |
-| Database Schema | `rwa-tokenization.sql` | PostgreSQL schema and indexes |
+| Database Schema | `rwa-tokenization.sql` | PostgreSQL schema, indexes, views, and immutability triggers |
+| Outbox Publisher | `outbox/outbox-publisher.py` | Async Kafka delivery with retry tracking and dead letter queue |
+| Signing Gateway | `signing-gateway/gateway.py` | 2-of-3 MPC threshold signing coordinator |
+| MPC Nodes | `mpc/node.py` | Individual MPC signing node (simulated) |
+| Containerized Service | `rwa-service/rwa-service.py` | Docker-native version of core services |
 
 ---
 
@@ -102,32 +106,51 @@ Unlike permissionless DeFi tokens, RWA tokens are **regulated securities**. Ever
 ## Core Services
 
 ### `RWARegistry`
-The entry point for any new tokenized asset. Validates that the custodian is licensed and approved, writes the asset record and an outbox event atomically, and begins the asset at `PENDING_LEGAL` status. Idempotency is enforced at the registration key level, preventing the same asset from ever being registered twice.
+The entry point for any new tokenized asset. Requires the `ADMIN` role. Validates that the custodian is licensed and approved, writes the asset record and an outbox event atomically, and begins the asset at `PENDING_LEGAL` status. Idempotency is enforced at the registration key level, preventing the same asset from ever being registered twice. Every call generates a `request_id` and records the actor and optional `trace_id` in both the state transition and outbox event payload.
 
 ### `LegalWrapperService`
-Creates the legal entity (SPV, Delaware Trust, LLC, or regulated Fund) that holds the real-world asset. This is the most critical layer in RWA infrastructure — it establishes the enforceable legal claim that backs each token. Calculates token economics (`price_per_token = total_value / token_supply`), initializes the token supply tracker, and advances the asset state machine to `PENDING_AUDIT`.
+Creates the legal entity (SPV, Delaware Trust, LLC, or regulated Fund) that holds the real-world asset. Requires the `ADMIN` role. This is the most critical layer in RWA infrastructure — it establishes the enforceable legal claim that backs each token. Calculates token economics (`price_per_token = total_value / token_supply`), initializes the token supply tracker, and advances the asset state machine to `PENDING_AUDIT`.
 
 ### `KYCComplianceService`
-Handles full investor onboarding with a three-phase approach. First, it runs an OFAC/EU/UN sanctions screening. Then it calls the KYC provider (e.g., Securitize) for identity and accreditation verification. Both external calls happen **outside** the database transaction to avoid holding row locks during slow API calls. Finally, it atomically writes the compliance record and whitelists the investor's wallet address. Also exposes `can_transfer()` — called before every single token transfer — and `revoke_whitelist()` for expired or exited investors.
+Handles full investor onboarding with a three-phase approach. Requires the `COMPLIANCE` role for `onboard_investor()` and `revoke_whitelist()`. First, it runs an OFAC/EU/UN sanctions screening. Then it calls the KYC provider (e.g., Securitize) for identity and accreditation verification. Both external calls happen **outside** the database transaction to avoid holding row locks during slow API calls. Finally, it atomically writes the compliance record and whitelists the investor's wallet address. Also exposes `can_transfer()` — called before every single token transfer — and `revoke_whitelist()` for expired or exited investors.
 
 ### `TokenMintingService`
-Triggered when an investor's fiat wire is received. Uses pessimistic locking (`SELECT ... FOR UPDATE`) on the token supply row to prevent overselling. Atomically reserves tokens, creates the mint record, and writes an outbox event in a single transaction. The signing queue message is sent outside the transaction. On-chain confirmation is handled by `confirm_mint()`, which settles the ledger.
+Triggered when an investor's fiat wire is received. Requires the `ADMIN` role for `mint_tokens()` and the `SYSTEM` role for `confirm_mint()`. Uses pessimistic locking (`SELECT ... FOR UPDATE`) on the token supply row to prevent overselling. Atomically reserves tokens, creates the mint record, and writes an outbox event in a single transaction. The signing queue message is sent outside the transaction. On-chain confirmation is handled by `confirm_mint()`, which settles the ledger with a double-entry accounting entry.
 
 ### `NAVCalculationEngine`
-Runs daily to calculate and distribute yield from the underlying asset (e.g., T-bill interest). Computes `daily_yield = total_value × (annual_rate / 365)`, updates the fund's total value, and emits an outbox event that triggers a token rebase on-chain — the mechanism by which investors receive yield as additional tokens rather than as a price increase.
+Runs daily to calculate and distribute yield from the underlying asset (e.g., T-bill interest). Requires the `SYSTEM` role. Computes `daily_yield = total_value × (annual_rate / 365)`, updates the fund's total value, and emits an outbox event that triggers a token rebase on-chain — the mechanism by which investors receive yield as additional tokens rather than as a price increase.
 
 ### `TokenRedemptionService`
-The inverse of minting. Manages the full redemption lifecycle: verifying the investor's compliance status, locking their token balance, publishing a burn transaction to the signing queue, and finally settling by releasing supply counters and triggering a fiat wire transfer. The most operationally complex flow because it coordinates three separate systems — blockchain, compliance, and traditional banking — that must all succeed or roll back together.
+The inverse of minting. Requires the `ADMIN` role for `request_redemption()` and the `SYSTEM` role for `settle_redemption()`. Manages the full redemption lifecycle: verifying the investor's compliance status, locking their token balance, publishing a burn transaction to the signing queue, and finally settling by releasing supply counters and triggering a fiat wire transfer. The most operationally complex flow because it coordinates three separate systems — blockchain, compliance, and traditional banking — that must all succeed or roll back together.
 
 ### `RWAReconciliationEngine`
 Daily audit engine that cross-checks four sources of truth: the internal ledger vs. on-chain token supply, the fund NAV vs. the custodian's reported assets under management, and a scan for tokens held by non-whitelisted wallets. Any discrepancy immediately triggers a critical alert and halts all new minting and redemptions until the mismatch is resolved.
 
 ### `RWAOutboxPublisher`
-Background poller that delivers `outbox_events` to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe multi-instance operation. Records delivery by inserting into `outbox_published` (append-only — no `published_at` column on `outbox_events` itself), ensuring exactly-once delivery semantics even across crashes and restarts. Runs as a separate Docker service under a restricted `readonly_user` database role that holds only `SELECT` and `UPDATE` on `outbox_events` (UPDATE is required by PostgreSQL for `FOR UPDATE` row locking — the immutability trigger prevents actual data mutation), `SELECT` on `outbox_published`, and `INSERT` on `outbox_published`.
+Background poller that delivers `outbox_events` to Kafka. Uses `FOR UPDATE SKIP LOCKED` for safe multi-instance operation. Records delivery by inserting into `outbox_published` (append-only — no `published_at` column on `outbox_events` itself), ensuring exactly-once delivery semantics even across crashes and restarts.
+
+Failed deliveries are tracked in `outbox_publish_attempts`. After 5 consecutive failures, the event is moved to the `outbox_dlq` dead letter queue and a copy is published to a `rwa.dlq.<event_type>` Kafka topic for downstream alerting. Dead-lettered events are excluded from future polling via the updated `v_unpublished_events` view.
+
+Runs as a separate Docker service under a restricted `readonly_user` database role that holds only `SELECT` and `UPDATE` on `outbox_events` (UPDATE is required by PostgreSQL for `FOR UPDATE` row locking — the immutability trigger prevents actual data mutation), `SELECT` on `outbox_published`, `INSERT` on `outbox_published`, and `SELECT`/`INSERT` on both `outbox_publish_attempts` and `outbox_dlq`.
 
 ---
 
 ## Key Features & Design Patterns
+
+### Role-Based Access Control (RBAC)
+Every service method enforces role requirements before executing any business logic. Four roles map to distinct operational responsibilities:
+
+| Role | Permitted Operations |
+|---|---|
+| `ADMIN` | Register assets, create legal wrappers, mint tokens, request redemptions |
+| `COMPLIANCE` | Onboard investors (KYC/AML), revoke whitelists |
+| `SYSTEM` | Confirm mints, settle redemptions, calculate NAV/yield |
+| `SIGNER` | Reserved for MPC signing operations |
+
+The `require_role()` guard raises `UnauthorizedError` if the caller's role is not in the allowed list for that operation. Each `Actor` carries an `actor_id`, `role`, and `name` that are recorded in every state transition and outbox event for full audit traceability.
+
+### Audit Trail with Request Correlation
+Every state transition records three additional fields beyond the state change itself: `request_id` (unique per operation), `trace_id` (shared across a multi-step workflow), and `actor` (the RBAC identity that initiated the action). These same fields are embedded in every outbox event payload, enabling end-to-end correlation from a single API call through the database ledger, Kafka event stream, and downstream consumers.
 
 ### Full Asset Lifecycle State Machine
 Assets progress through a strict sequence: `PENDING_LEGAL → PENDING_AUDIT → APPROVED → TOKENIZED → REDEEMED`. State guards at each transition prevent operations from running out of order — you cannot mint tokens for an asset that hasn't cleared legal review.
@@ -146,6 +169,9 @@ The `rwa_token_supply` row is locked with `SELECT ... FOR UPDATE` before every m
 
 ### Transactional Outbox Pattern (All Services)
 Every service writes its outbox event in the **same database transaction** as the business record. This eliminates the dual-write problem across all six services. The `RWAOutboxPublisher` delivers events to Kafka only after they are safely committed to Postgres, so downstream services (investor dashboards, compliance systems, on-chain oracles) never miss an event even if the application crashes.
+
+### Dead Letter Queue with Retry Tracking
+Failed Kafka deliveries are not silently dropped. Each failed attempt is recorded in `outbox_publish_attempts` with the error message and timestamp. After 5 consecutive failures, the event is moved to `outbox_dlq` and a copy is published to a `rwa.dlq.<event_type>` Kafka topic for downstream alerting. The `v_unpublished_events` view automatically excludes dead-lettered events, so the publisher only retries events that still have remaining attempts. All DLQ tables are append-only with immutability triggers.
 
 ### Atomic Ledger Settlement
 Token supply updates (`minted_supply += amount`) and record creation are always co-located in the same transaction. During redemption, the supply release and settlement status update are committed together or not at all — the ledger never shows tokens as both outstanding and redeemed.
@@ -287,6 +313,57 @@ Tracks which outbox events have been delivered to Kafka. A row here means the ev
 | `event_id` | UUID UNIQUE | Foreign key to `outbox_events` |
 | `published_at` | TIMESTAMP | When Kafka delivery succeeded |
 
+### `outbox_publish_attempts`
+Records each failed Kafka delivery attempt. Used by the outbox publisher to count retries before dead-lettering an event. Append-only.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `event_id` | UUID | Foreign key to `outbox_events` |
+| `error_message` | TEXT | Error from the failed delivery |
+| `attempted_at` | TIMESTAMP | When the attempt occurred |
+
+### `outbox_dlq`
+Dead letter queue for events that exceeded the maximum retry count (default: 5). Once an event is dead-lettered, it is excluded from `v_unpublished_events` and will not be retried. Append-only.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `event_id` | UUID UNIQUE | Foreign key to `outbox_events` |
+| `error_message` | TEXT | Reason for dead-lettering |
+| `attempts` | INTEGER | Total delivery attempts before giving up |
+| `created_at` | TIMESTAMP | When the event was dead-lettered |
+
+### `state_transitions`
+Append-only audit log of every state change in the system. Each row captures the entity, the transition, and full RBAC context (who did it, which request, which trace).
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `entity_type` | VARCHAR(20) | `asset`, `mint`, `redemption`, `compliance` |
+| `entity_id` | UUID | ID of the entity that changed state |
+| `from_state` | VARCHAR(20) | Previous state (NULL for initial transitions) |
+| `to_state` | VARCHAR(20) | New state |
+| `metadata` | JSONB | Additional context (e.g., reason for revocation) |
+| `request_id` | UUID | Unique ID for this operation |
+| `trace_id` | UUID | Shared ID across a multi-step workflow |
+| `actor` | VARCHAR(256) | RBAC identity (`role:name`) that initiated the action |
+| `created_at` | TIMESTAMP | When the transition occurred |
+
+### `ledger_entries`
+Double-entry accounting journal. Every financial operation (mint, redemption, yield) produces balanced debit/credit pairs. Balances are never stored directly — they are derived from this table via `v_investor_balance`. Append-only.
+
+| Column | Type | Description |
+|---|---|---|
+| `id` | UUID | Primary key |
+| `asset_id` | UUID | Foreign key to `rwa_assets` |
+| `entry_type` | VARCHAR(20) | `mint`, `redemption`, `yield` |
+| `debit_account` | VARCHAR(256) | Account debited |
+| `credit_account` | VARCHAR(256) | Account credited |
+| `amount` | DECIMAL(38,18) | Transaction amount |
+| `reference_id` | UUID | ID of the originating record (mint, redemption, etc.) |
+| `created_at` | TIMESTAMP | When the entry was recorded |
+
 ---
 
 ## State Machines
@@ -417,9 +494,11 @@ pip install psycopg2-binary kafka-python-ng
 python3 rwa-tokenization.py
 ```
 
-The script connects to PostgreSQL on `localhost:5433` and runs all eight steps end-to-end — asset registration, legal wrapper creation, investor onboarding, token minting, daily yield calculation, reconciliation, redemption, and outbox publishing.
+The script connects to PostgreSQL on `localhost:5433` and Kafka on `localhost:29092` (the external listener), then runs all eight steps end-to-end — asset registration, legal wrapper creation, investor onboarding, token minting, daily yield calculation, reconciliation, redemption, and outbox publishing.
 
 If Kafka is not reachable from the host, the script falls back to a no-op queue and prints a warning. All database operations still execute normally.
+
+> **Note:** Kafka uses a dual-listener setup — `INTERNAL://kafka:9092` for container-to-container traffic and `EXTERNAL://localhost:29092` for host access. The host-side script connects to the external listener automatically.
 
 ### 4. Tear Down and Reset
 
@@ -491,12 +570,13 @@ JOIN v_current_state cs
 ORDER BY tm.token_amount DESC;
 ```
 
-#### State Transition History
+#### State Transition History (with RBAC Audit Trail)
 
-Every state change in the system is recorded as an append-only event. Query the full audit trail:
+Every state change in the system is recorded as an append-only event with full RBAC context. Query the full audit trail:
 
 ```sql
-SELECT entity_type, entity_id, from_state, to_state, created_at
+SELECT entity_type, entity_id, from_state, to_state,
+       actor, request_id, trace_id, created_at
 FROM state_transitions
 ORDER BY created_at;
 ```
@@ -505,6 +585,16 @@ Or view only the current state of each entity:
 
 ```sql
 SELECT * FROM v_current_state ORDER BY entity_type, created_at;
+```
+
+Trace all operations from a single workflow using the shared `trace_id`:
+
+```sql
+SELECT entity_type, entity_id, from_state, to_state,
+       actor, request_id, created_at
+FROM state_transitions
+WHERE trace_id = '<your-trace-id>'
+ORDER BY created_at;
 ```
 
 #### Double-Entry Ledger
@@ -586,6 +676,27 @@ Check for any unpublished events (should be empty after the outbox publisher run
 SELECT * FROM v_unpublished_events;
 ```
 
+#### Dead Letter Queue
+
+View events that permanently failed delivery after exhausting all retries:
+
+```sql
+SELECT dlq.event_id, oe.event_type, dlq.attempts,
+       dlq.error_message, dlq.created_at
+FROM outbox_dlq dlq
+JOIN outbox_events oe ON oe.id = dlq.event_id
+ORDER BY dlq.created_at;
+```
+
+View individual delivery attempts for a specific event:
+
+```sql
+SELECT event_id, error_message, attempted_at
+FROM outbox_publish_attempts
+WHERE event_id = '<event-id>'
+ORDER BY attempted_at;
+```
+
 #### Append-Only Verification
 
 Every table is protected by an immutability trigger. You can verify that UPDATE and DELETE are blocked:
@@ -611,7 +722,9 @@ UNION ALL SELECT 'token_redemptions', COUNT(*) FROM token_redemptions
 UNION ALL SELECT 'state_transitions', COUNT(*) FROM state_transitions
 UNION ALL SELECT 'ledger_entries', COUNT(*) FROM ledger_entries
 UNION ALL SELECT 'outbox_events', COUNT(*) FROM outbox_events
-UNION ALL SELECT 'outbox_published', COUNT(*) FROM outbox_published;
+UNION ALL SELECT 'outbox_published', COUNT(*) FROM outbox_published
+UNION ALL SELECT 'outbox_publish_attempts', COUNT(*) FROM outbox_publish_attempts
+UNION ALL SELECT 'outbox_dlq', COUNT(*) FROM outbox_dlq;
 ```
 
 ### Checking Kafka Messages
@@ -636,6 +749,7 @@ Expected topics after a full demo run include:
 | `rwa.nav.yield_calculated` | Daily yield distribution |
 | `rwa.token.redemption_requested` | Redemption initiated |
 | `rwa.token.redemption_settled` | Fiat wire completed |
+| `rwa.dlq.<event_type>` | Dead-lettered events (after 5 failed delivery attempts) |
 
 #### Read Messages from a Specific Topic
 
@@ -776,8 +890,7 @@ RWA-PYTHON/
 | Hardware Security Module (HSM) for signing | Private keys exposed in software |
 | Multi-signature approval workflow | Single point of failure for token issuance |
 | Custodian API reconciliation | No way to verify on-chain supply matches real-world assets |
-| Authentication & authorization | Any caller can register assets, mint, or redeem |
-| Dead-letter queue & retry logic | Failed events silently dropped |
+| Authentication & authorization | RBAC roles are enforced but there is no authentication layer (no JWT, no API gateway) |
 | Comprehensive test suite | Untested edge cases in financial state machines |
 | Regulatory registration | Operating without required licenses (e.g., SEC, FINRA, MAS) |
 
