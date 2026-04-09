@@ -18,6 +18,8 @@
 - [State Machines](#-state-machines)
 - [Real-World Example: BlackRock BUIDL](#-real-world-example-blackrock-buidl)
 - [Running in a Sandbox Environment](#-running-in-a-sandbox-environment)
+- [Makefile Commands](#-makefile-commands)
+- [Testing](#-testing)
 - [Verifying the System](#-verifying-the-system)
   - [Inspecting the PostgreSQL Database](#inspecting-the-postgresql-database)
   - [Checking Kafka Messages](#checking-kafka-messages)
@@ -518,6 +520,85 @@ docker-compose down -v && docker-compose up -d
 
 ---
 
+## Makefile Commands
+
+A `Makefile` provides single-command access to all common operations:
+
+```bash
+make help          # Show all available targets
+```
+
+### Lifecycle
+
+| Command | Description |
+|---|---|
+| `make up` | Build and start all services (`docker compose up --build -d`) |
+| `make down` | Stop containers and remove volumes (full reset) |
+
+### Demo & Logs
+
+| Command | Description |
+|---|---|
+| `make demo` | Show demo output from the rwa-service container |
+| `make logs` | Tail logs from all containers in real time |
+
+### Database Inspection
+
+| Command | Description |
+|---|---|
+| `make db-balances` | Show investor balances derived from the ledger |
+| `make db-ledger` | Show the double-entry ledger journal |
+| `make db-audit` | Show the full state transition audit trail |
+| `make db-states` | Show the current state of each entity |
+| `make db-outbox` | Show outbox events with delivery status |
+| `make db-dlq` | Show dead-lettered events |
+| `make db-tables` | Show row counts for all tables |
+| `make db-immutable-test` | Verify append-only triggers reject mutations |
+| `make shell-pg` | Open an interactive `psql` shell |
+
+### Kafka & Testing
+
+| Command | Description |
+|---|---|
+| `make topics` | List Kafka topics |
+| `make test` | Run integration tests (requires `make up` first) |
+
+---
+
+## Testing
+
+The `tests/test_core.py` file contains integration tests that validate the most critical invariants of the system. Tests run against the live PostgreSQL instance started by `make up`.
+
+### Running Tests
+
+```bash
+# Start the stack first
+make up
+
+# Install test dependencies
+pip install psycopg2-binary pytest
+
+# Run tests
+make test
+```
+
+### What the Tests Cover
+
+| Test | Invariant |
+|---|---|
+| `test_ledger_entry_creates_balanced_pair` | Every ledger entry has matching debit/credit accounts with the same amount |
+| `test_investor_balance_derived_from_ledger` | Balances are computed from journal entries, not stored (mint 1000, redeem 300 = 700) |
+| `test_append_only_rejects_update_on_rwa_assets` | `prevent_mutation()` trigger blocks UPDATE on core tables |
+| `test_append_only_rejects_delete_on_ledger` | `prevent_mutation()` trigger blocks DELETE on ledger_entries |
+| `test_state_transition_records_audit_context` | State transitions carry `request_id`, `trace_id`, and `actor` metadata |
+| `test_current_state_reflects_latest_transition` | `v_current_state` view returns the most recent state per entity |
+| `test_idempotency_key_prevents_duplicate_insert` | UNIQUE constraint on `idempotency_key` rejects duplicate registrations |
+| `test_outbox_tables_are_append_only` | Outbox tables reject UPDATE/DELETE via immutability triggers |
+
+All tests use transaction rollback to avoid polluting the database between runs.
+
+---
+
 ## Verifying the System
 
 After running the demo, you can inspect every layer of the system — the PostgreSQL ledger, Kafka event streams, and outbox publisher logs.
@@ -848,6 +929,7 @@ docker-compose logs -f
 ```
 RWA-PYTHON/
 │
+├── Makefile                       # make up / down / demo / logs / db-balances / test
 ├── docker-compose.yaml            # Full stack: DB, Kafka, services, signing
 ├── rwa-tokenization.py            # Host-runnable demo (all service classes)
 ├── rwa-tokenization.sql           # PostgreSQL schema (tables + indexes)
@@ -870,9 +952,12 @@ RWA-PYTHON/
 │   ├── Dockerfile
 │   └── gateway.py                 # 2-of-3 MPC threshold signing coordinator
 │
-└── mpc/
-    ├── Dockerfile
-    └── node.py                    # Individual MPC signing node
+├── mpc/
+│   ├── Dockerfile
+│   └── node.py                    # Individual MPC signing node
+│
+└── tests/
+    └── test_core.py               # Integration tests (8 tests, ~130 lines)
 ```
 
 ---
