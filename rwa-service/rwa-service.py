@@ -1,6 +1,7 @@
 import os
 import uuid
 import json
+import hashlib
 import logging
 from datetime import datetime, timezone
 from enum import Enum
@@ -971,6 +972,34 @@ class TokenMintingService:
 
         return mint
 
+    def advance_mint_pipeline(
+        self, mint_id, signer_ids,
+        actor=None, trace_id=None
+    ):
+        """Drive PENDING→APPROVED→SIGNED→BROADCAST.
+        Returns list of request_id UUIDs."""
+        actor_str = str(actor) if actor else None
+        transitions = [
+            (MintStatus.PENDING,   MintStatus.APPROVED, {}),
+            (MintStatus.APPROVED,  MintStatus.SIGNED,
+             {"signers": signer_ids}),
+            (MintStatus.SIGNED,    MintStatus.BROADCAST, {}),
+        ]
+        results = []
+        for from_s, to_s, meta in transitions:
+            req_id = uuid.uuid4()
+            with self.db.transaction() as conn:
+                insert_state_transition(
+                    conn, 'mint', mint_id,
+                    from_s.value, to_s.value,
+                    meta,
+                    request_id=req_id,
+                    trace_id=trace_id,
+                    actor=actor_str,
+                )
+            results.append(req_id)
+        return results
+
     def confirm_mint(
         self, mint_id, tx_hash, block_number,
         actor=None, trace_id=None
@@ -996,7 +1025,7 @@ class TokenMintingService:
             actor_str = str(actor) if actor else None
             insert_state_transition(
                 conn, 'mint', mint_id,
-                MintStatus.PENDING.value,
+                MintStatus.BROADCAST.value,
                 MintStatus.CONFIRMED.value,
                 {
                     "tx_hash": tx_hash,
@@ -1173,6 +1202,31 @@ class TokenRedemptionService:
         )
 
         return redemption_id
+
+    def confirm_burn(
+        self, redemption_id, tx_hash, block_number,
+        signer_ids, actor=None, trace_id=None
+    ):
+        """Drive PENDING→APPROVED→BURNING→BURNED with
+        on-chain burn tx hash and block number."""
+        actor_str = str(actor) if actor else None
+        transitions = [
+            (RedemptionStatus.PENDING,  RedemptionStatus.APPROVED, {}),
+            (RedemptionStatus.APPROVED, RedemptionStatus.BURNING,
+             {"signers": signer_ids}),
+            (RedemptionStatus.BURNING,  RedemptionStatus.BURNED,
+             {"tx_hash": tx_hash, "block_number": block_number}),
+        ]
+        for from_s, to_s, meta in transitions:
+            with self.db.transaction() as conn:
+                insert_state_transition(
+                    conn, 'redemption', redemption_id,
+                    from_s.value, to_s.value,
+                    meta,
+                    request_id=uuid.uuid4(),
+                    trace_id=trace_id,
+                    actor=actor_str,
+                )
 
     def settle_redemption(
         self, redemption_id,
@@ -1687,6 +1741,24 @@ if __name__ == "__main__":
             for d in details:
                 print(f"    {d}")
 
+    class SimulatedBlockchain:
+        """Generates realistic Ethereum tx hashes and
+        incrementing block numbers for demo output."""
+
+        def __init__(self, starting_block=19_000_000):
+            self._block = starting_block
+            self._tx_index = 0
+
+        def submit_tx(self, operation, payload=""):
+            self._tx_index += 1
+            raw = f"{operation}:{payload}:{self._tx_index}"
+            tx_hash = (
+                "0x"
+                + hashlib.sha256(raw.encode()).hexdigest()
+            )
+            self._block += 1
+            return tx_hash, self._block
+
     # -- Helpers --
 
     def header(step, title):
@@ -1728,6 +1800,7 @@ if __name__ == "__main__":
     blockchain_svc = StubBlockchainService(db)
     custodian_api = StubCustodianAPI(db)
     alert_service = StubAlertService()
+    chain = SimulatedBlockchain(starting_block=19_000_000)
 
     registry = RWARegistry(db, None)
     legal_svc = LegalWrapperService(db)
@@ -1904,13 +1977,34 @@ if __name__ == "__main__":
             actor=admin_actor,
             trace_id=demo_trace_id,
         )
+        # MPC signing pipeline: PENDING→APPROVED→SIGNED→BROADCAST
+        signer_ids = ["mpc-node-1", "mpc-node-2", "mpc-node-3"]
+        mint_svc.advance_mint_pipeline(
+            mint.id, signer_ids,
+            actor=system_actor, trace_id=demo_trace_id,
+        )
+        mint_tx, mint_block = chain.submit_tx(
+            "mint_tokens", f"{inv_id}:{token_amount}"
+        )
+        mint_svc.confirm_mint(
+            mint.id,
+            tx_hash=mint_tx,
+            block_number=mint_block,
+            actor=system_actor,
+            trace_id=demo_trace_id,
+        )
         mint_records.append(
             (name, inv_id, wallet, token_amount, mint)
         )
         kv(f"{name}:", "")
         kv("  Tokens Minted:", f"{token_amount:,}")
         kv("  Fiat Received:", f"${amount:,.2f}")
-        kv("  Mint Status:", MintStatus.PENDING.value)
+        kv("  MPC Signers:", ", ".join(signer_ids))
+        kv("  Pipeline:",
+           "PENDING→APPROVED→SIGNED→BROADCAST→CONFIRMED")
+        kv("  Mint Tx Hash:", mint_tx[:18] + "...")
+        kv("  Block Number:", f"{mint_block:,}")
+        kv("  Mint Status:", MintStatus.CONFIRMED.value)
         kv("  Actor:", str(admin_actor))
         print()
 
@@ -1971,17 +2065,6 @@ if __name__ == "__main__":
     )
     redeem_amount = 5_000_000
 
-    # Confirm the mint first so the redemption balance
-    # check finds confirmed ledger entries.
-    gs_mint = mint_records[2][4]
-    mint_svc.confirm_mint(
-        gs_mint.id,
-        tx_hash="0x" + uuid.uuid4().hex,
-        block_number=19_000_000,
-        actor=system_actor,
-        trace_id=demo_trace_id,
-    )
-
     redemption_id = redemption_svc.request_redemption(
         asset_id=asset_id,
         investor_id=gs_id,
@@ -1993,13 +2076,34 @@ if __name__ == "__main__":
         trace_id=demo_trace_id,
     )
 
+    burn_tx, burn_block = chain.submit_tx(
+        "burn_tokens", f"{gs_id}:{redeem_amount}"
+    )
     fiat_out = Decimal(str(redeem_amount)) * price_per_token
+    signer_ids = ["mpc-node-1", "mpc-node-2", "mpc-node-3"]
+    redemption_svc.confirm_burn(
+        redemption_id,
+        tx_hash=burn_tx,
+        block_number=burn_block,
+        signer_ids=signer_ids,
+        actor=system_actor,
+        trace_id=demo_trace_id,
+    )
+    redemption_svc.settle_redemption(
+        redemption_id,
+        actor=system_actor,
+        trace_id=demo_trace_id,
+    )
     kv("Investor:", gs_name)
     kv("Tokens Redeemed:", f"{redeem_amount:,}")
     kv("Fiat Returned:", f"${fiat_out:,.2f}")
     kv("Wire Destination:", "CHASE-WIRE-****7890")
-    kv("Redemption Status:",
-       RedemptionStatus.PENDING.value)
+    kv("MPC Signers:", ", ".join(signer_ids))
+    kv("Pipeline:",
+       "PENDING→APPROVED→BURNING→BURNED→SETTLED")
+    kv("Burn Tx Hash:", burn_tx[:18] + "...")
+    kv("Block Number:", f"{burn_block:,}")
+    kv("Redemption Status:", RedemptionStatus.SETTLED.value)
     kv("Redemption ID:",
        str(redemption_id)[:12] + "...")
 

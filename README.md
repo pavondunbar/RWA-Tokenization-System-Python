@@ -85,8 +85,8 @@ Unlike permissionless DeFi tokens, RWA tokens are **regulated securities**. Ever
 
   4. TokenMintingService      Investor wires fiat
      (mint_tokens) ──────────────────────────────────► Lock supply
-                                                        + Signing Queue
-                                                              │
+     (advance_mint_pipeline)                            + Signing Queue
+     (confirm_mint)                                           │
                                                               ▼
                                                         ERC-1400 mint()
                                                         on Ethereum
@@ -98,7 +98,8 @@ Unlike permissionless DeFi tokens, RWA tokens are **regulated securities**. Ever
 
   6. TokenRedemptionService   Investor returns tokens
      (request_redemption) ───────────────────────────► Burn on-chain
-     (settle_redemption)                                Wire fiat back
+     (confirm_burn)                                     Wire fiat back
+     (settle_redemption)
 
   7. RWAReconciliationEngine  Daily verification
      (reconcile_asset) ──── Blockchain node ─────────► Mismatch alert
@@ -119,13 +120,13 @@ Creates the legal entity (SPV, Delaware Trust, LLC, or regulated Fund) that hold
 Handles full investor onboarding with a three-phase approach. Requires the `COMPLIANCE` role for `onboard_investor()` and `revoke_whitelist()`. First, it runs an OFAC/EU/UN sanctions screening. Then it calls the KYC provider (e.g., Securitize) for identity and accreditation verification. Both external calls happen **outside** the database transaction to avoid holding row locks during slow API calls. Finally, it atomically writes the compliance record and whitelists the investor's wallet address. Also exposes `can_transfer()` — called before every single token transfer — and `revoke_whitelist()` for expired or exited investors.
 
 ### `TokenMintingService`
-Triggered when an investor's fiat wire is received. Requires the `ADMIN` role for `mint_tokens()` and the `SYSTEM` role for `confirm_mint()`. Uses pessimistic locking (`SELECT ... FOR UPDATE`) on the token supply row to prevent overselling. Atomically reserves tokens, creates the mint record, and writes an outbox event in a single transaction. The signing queue message is sent outside the transaction. On-chain confirmation is handled by `confirm_mint()`, which settles the ledger with a double-entry accounting entry.
+Triggered when an investor's fiat wire is received. Requires the `ADMIN` role for `mint_tokens()` and the `SYSTEM` role for `advance_mint_pipeline()` and `confirm_mint()`. Uses pessimistic locking (`SELECT ... FOR UPDATE`) on the token supply row to prevent overselling. Atomically reserves tokens, creates the mint record, and writes an outbox event in a single transaction. The signing queue message is sent outside the transaction. `advance_mint_pipeline()` drives the mint through `PENDING → APPROVED → SIGNED → BROADCAST`, recording each state transition with the MPC signer IDs in the metadata. On-chain confirmation is handled by `confirm_mint()`, which settles the ledger with a double-entry accounting entry.
 
 ### `NAVCalculationEngine`
 Runs daily to calculate and distribute yield from the underlying asset (e.g., T-bill interest). Requires the `SYSTEM` role. Computes `daily_yield = total_value × (annual_rate / 365)`, updates the fund's total value, and emits an outbox event that triggers a token rebase on-chain — the mechanism by which investors receive yield as additional tokens rather than as a price increase.
 
 ### `TokenRedemptionService`
-The inverse of minting. Requires the `ADMIN` role for `request_redemption()` and the `SYSTEM` role for `settle_redemption()`. Manages the full redemption lifecycle: verifying the investor's compliance status, locking their token balance, publishing a burn transaction to the signing queue, and finally settling by releasing supply counters and triggering a fiat wire transfer. The most operationally complex flow because it coordinates three separate systems — blockchain, compliance, and traditional banking — that must all succeed or roll back together.
+The inverse of minting. Requires the `ADMIN` role for `request_redemption()` and the `SYSTEM` role for `confirm_burn()` and `settle_redemption()`. Manages the full redemption lifecycle: verifying the investor's compliance status, locking their token balance, publishing a burn transaction to the signing queue, driving the redemption through `PENDING → APPROVED → BURNING → BURNED` via `confirm_burn()` (embedding the burn tx hash and block number at the `BURNED` transition), and finally settling by releasing supply counters and triggering a fiat wire transfer. The most operationally complex flow because it coordinates three separate systems — blockchain, compliance, and traditional banking — that must all succeed or roll back together.
 
 ### `RWAReconciliationEngine`
 Daily audit engine that cross-checks four sources of truth: the internal ledger vs. on-chain token supply, the fund NAV vs. the custodian's reported assets under management, and a scan for tokens held by non-whitelisted wallets. Any discrepancy immediately triggers a critical alert and halts all new minting and redemptions until the mismatch is resolved.
@@ -401,18 +402,18 @@ Double-entry accounting journal. Every financial operation (mint, redemption, yi
 
 ### Token Mint Status
 ```
-  mint_tokens() ────► PENDING ──► APPROVED ──► SIGNED ──► BROADCAST
-                                                                │
-                                                    ┌───────────┴──────────┐
-                                                    ▼                      ▼
-                                               CONFIRMED               FAILED
+  mint_tokens() ────► PENDING ──► APPROVED ──► SIGNED ──► BROADCAST ──► CONFIRMED
+                                  └─────────────────────────────────┘         │
+                                       advance_mint_pipeline()             FAILED
+                                                                    confirm_mint()
 ```
 
 ### Redemption Status
 ```
   request_redemption() ──► PENDING ──► APPROVED ──► BURNING ──► BURNED ──► SETTLED
-                                                                              │
-                                                                        (fiat wired)
+                                       └──────────────────────────────┘        │
+                                                 confirm_burn()           (fiat wired)
+                                                                      settle_redemption()
 ```
 
 ---

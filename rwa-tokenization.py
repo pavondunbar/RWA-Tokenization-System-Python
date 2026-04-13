@@ -971,6 +971,36 @@ class TokenMintingService:
 
         return mint
 
+    def advance_mint_pipeline(
+        self, mint_id, signer_ids,
+        actor=None, trace_id=None
+    ):
+        """Drive PENDING→APPROVED→SIGNED→BROADCAST.
+        Returns (approve_req, sign_req, broadcast_req) UUIDs."""
+        results = []
+        transitions = [
+            (MintStatus.PENDING,   MintStatus.APPROVED),
+            (MintStatus.APPROVED,  MintStatus.SIGNED),
+            (MintStatus.SIGNED,    MintStatus.BROADCAST),
+        ]
+        actor_str = str(actor) if actor else None
+        for from_s, to_s in transitions:
+            req_id = uuid.uuid4()
+            meta = {}
+            if to_s == MintStatus.SIGNED:
+                meta["signers"] = signer_ids
+            with self.db.transaction() as conn:
+                insert_state_transition(
+                    conn, 'mint', mint_id,
+                    from_s.value, to_s.value,
+                    meta,
+                    request_id=req_id,
+                    trace_id=trace_id,
+                    actor=actor_str,
+                )
+            results.append(req_id)
+        return results
+
     def confirm_mint(
         self, mint_id, tx_hash, block_number,
         actor=None, trace_id=None
@@ -1173,6 +1203,31 @@ class TokenRedemptionService:
         )
 
         return redemption_id
+
+    def confirm_burn(
+        self, redemption_id, tx_hash, block_number,
+        signer_ids, actor=None, trace_id=None
+    ):
+        """Drive PENDING→APPROVED→BURNING→BURNED with
+        on-chain burn tx hash and block number."""
+        actor_str = str(actor) if actor else None
+        transitions = [
+            (RedemptionStatus.PENDING,  RedemptionStatus.APPROVED, {}),
+            (RedemptionStatus.APPROVED, RedemptionStatus.BURNING,
+             {"signers": signer_ids}),
+            (RedemptionStatus.BURNING,  RedemptionStatus.BURNED,
+             {"tx_hash": tx_hash, "block_number": block_number}),
+        ]
+        for from_s, to_s, meta in transitions:
+            with self.db.transaction() as conn:
+                insert_state_transition(
+                    conn, 'redemption', redemption_id,
+                    from_s.value, to_s.value,
+                    meta,
+                    request_id=uuid.uuid4(),
+                    trace_id=trace_id,
+                    actor=actor_str,
+                )
 
     def settle_redemption(
         self, redemption_id,
@@ -1931,6 +1986,12 @@ if __name__ == "__main__":
             actor=admin_actor,
             trace_id=demo_trace_id,
         )
+        # MPC signing pipeline: PENDING→APPROVED→SIGNED→BROADCAST
+        signer_ids = ["mpc-node-1", "mpc-node-2", "mpc-node-3"]
+        mint_svc.advance_mint_pipeline(
+            mint.id, signer_ids,
+            actor=system_actor, trace_id=demo_trace_id,
+        )
         mint_tx, mint_block = chain.submit_tx(
             "mint_tokens", f"{inv_id}:{token_amount}"
         )
@@ -1947,6 +2008,9 @@ if __name__ == "__main__":
         kv(f"{name}:", "")
         kv("  Tokens Minted:", f"{token_amount:,}")
         kv("  Fiat Received:", f"${amount:,.2f}")
+        kv("  MPC Signers:", ", ".join(signer_ids))
+        kv("  Pipeline:",
+           "PENDING→APPROVED→SIGNED→BROADCAST→CONFIRMED")
         kv("  Mint Tx Hash:", mint_tx[:18] + "...")
         kv("  Block Number:", f"{mint_block:,}")
         kv("  Mint Status:", MintStatus.CONFIRMED.value)
@@ -2031,14 +2095,30 @@ if __name__ == "__main__":
         "burn_tokens", f"{gs_id}:{redeem_amount}"
     )
     fiat_out = Decimal(str(redeem_amount)) * price_per_token
+    signer_ids = ["mpc-node-1", "mpc-node-2", "mpc-node-3"]
+    redemption_svc.confirm_burn(
+        redemption_id,
+        tx_hash=burn_tx,
+        block_number=burn_block,
+        signer_ids=signer_ids,
+        actor=system_actor,
+        trace_id=demo_trace_id,
+    )
+    redemption_svc.settle_redemption(
+        redemption_id,
+        actor=system_actor,
+        trace_id=demo_trace_id,
+    )
     kv("Investor:", gs_name)
     kv("Tokens Redeemed:", f"{redeem_amount:,}")
     kv("Fiat Returned:", f"${fiat_out:,.2f}")
     kv("Wire Destination:", "CHASE-WIRE-****7890")
+    kv("MPC Signers:", ", ".join(signer_ids))
+    kv("Pipeline:",
+       "PENDING→APPROVED→BURNING→BURNED→SETTLED")
     kv("Burn Tx Hash:", burn_tx[:18] + "...")
     kv("Block Number:", f"{burn_block:,}")
-    kv("Redemption Status:",
-       RedemptionStatus.PENDING.value)
+    kv("Redemption Status:", RedemptionStatus.SETTLED.value)
     kv("Redemption ID:",
        str(redemption_id)[:12] + "...")
 
